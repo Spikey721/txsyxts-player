@@ -28,18 +28,32 @@ no premium. no API keys. no python.
 # ubuntu/debian
 sudo apt install build-essential cmake libmpv-dev libcurl4-openssl-dev
 
-# arch
+# arch linux
 sudo pacman -S base-devel cmake mpv curl
+
+# fedora
+sudo dnf install @development-tools cmake mpv-libs-devel libcurl-devel
+
+# opensuse
+sudo zypper install -t pattern devel_basis
+sudo zypper install cmake mpv-devel libcurl-devel
 ```
 
 ### runtime dependencies
 
 ```bash
-# required
+# ubuntu/debian
 sudo apt install mpv
+pip3 install yt-dlp # highly recommended to use pip for the latest yt-dlp
 
-# youtube (required for streaming)
-pip install yt-dlp
+# arch linux
+sudo pacman -S mpv yt-dlp
+
+# fedora
+sudo dnf install mpv yt-dlp
+
+# opensuse
+sudo zypper install mpv yt-dlp
 ```
 
 ### build & install
