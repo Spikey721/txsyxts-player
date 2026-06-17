@@ -1,0 +1,22 @@
+# Build artifacts
+build/
+bin/
+a.out
+*.o
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# Editor & IDE
+.vscode/
+.idea/
+*.swp
+
+# Application Data
+.cache/
+config.json
+playlists.json
+local_playlists.json
