@@ -186,7 +186,13 @@ static void handle_command(AppState& st, const std::string& raw,
         }).detach();
 
     } else if (name == "playlist") {
-        st.set_log("spotify functionality coming soon!", true);
+        // Alias for :playlists — show local playlists
+        handle_command(st, ":playlists", screen);
+        return;
+
+    } else if (name == "home") {
+        st.view = ViewMode::Home;
+        st.set_log("type :help  ·  :play <query> to search");
 
 
     } else if (name == "search") {
@@ -595,36 +601,9 @@ int run_app() {
     auto controls = Container::Horizontal({ btn_prev, btn_play, btn_next, btn_loop, btn_autoplay });
 
     MenuOption track_opt;
-    track_opt.on_enter = [&] {
-        if (st.view == ViewMode::Tracks && !st.queue.empty()) {
-            auto t = st.queue.jump(st.selected);
-            if (t) { play_track(st, *t, &screen); update_ascii_art(st, *t, screen); }
-        } else if (st.view == ViewMode::Playlists && !st.playlists.empty()) {
-            auto pl = st.playlists[st.pl_selected];
-            st.set_log("loading playlist: " + pl.first + "...");
-            screen.Post(Event::Custom);
-            std::thread([&st, &screen, pl]() {
-                std::vector<Track> tracks;
-                if (pl.second.find("local:") == 0) {
-                    std::lock_guard<std::mutex> lk(st.mtx);
-                    tracks = st.local_playlists.get_tracks(pl.first);
-                } else if (pl.second.find("spotify:") == 0) {
-                    tracks = st.spotify.get_playlist_tracks(pl.second.substr(8));
-                } else {
-                    tracks = st.spotify.get_playlist_tracks(pl.second); // fallback
-                }
-
-                std::lock_guard<std::mutex> lk(st.mtx);
-                st.queue.load(tracks);
-                st.track_names.clear();
-                for (auto& t : tracks) st.track_names.push_back(t.title);
-                st.view = ViewMode::Tracks;
-                st.selected = 0;
-                st.set_log("loaded " + std::to_string(tracks.size()) + " tracks");
-                screen.Post(Event::Custom);
-            }).detach();
-        }
-    };
+    // on_enter intentionally left as no-op — Enter is handled exclusively
+    // by the CatchEvent handler below to avoid double-triggering play.
+    track_opt.on_enter = [] {};
     track_opt.entries_option.transform = [&](const EntryState& state) {
         bool focused = state.focused;
         if (st.view == ViewMode::Playlists) {
@@ -1041,6 +1020,27 @@ int run_app() {
                     }
                 } else {
                     st.set_log("not viewing a local playlist", true);
+                }
+            }
+            return true;
+        }
+
+        // Shift+- (underscore) — remove selected song from current local playlist
+        if (event == Event::Character('_') && input_str.empty()) {
+            if (st.view == ViewMode::Tracks && !st.queue.empty()) {
+                if (!st.current_local_playlist.empty()) {
+                    if (st.local_playlists.remove_track(st.current_local_playlist, st.selected)) {
+                        st.set_log("removed from " + st.current_local_playlist);
+                        st.queue.load(st.local_playlists.get_tracks(st.current_local_playlist));
+                        st.track_names.clear();
+                        for (auto& tr : st.queue.tracks()) st.track_names.push_back(tr.title);
+                        if (st.selected >= st.queue.length()) st.selected = std::max(0, st.queue.length() - 1);
+                        screen.Post(Event::Custom);
+                    } else {
+                        st.set_log("failed to remove track", true);
+                    }
+                } else {
+                    st.set_log("not in a local playlist (use Shift+- only in playlist view)", true);
                 }
             }
             return true;

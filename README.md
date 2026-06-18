@@ -13,7 +13,7 @@ minimal tui music player for linux. native c++ binary — just run `txsyxts`.
 - **local** — play .mp3 / .flac / .ogg / .opus / .wav files from disk
 - **local playlists** — instantly build and manage custom playlists on disk
 - **visualizer** — high resolution sub-pixel braille wave visualizer
-- **album art** — native Kitty terminal graphics protocol support for true image album art!
+- **album art** — album art via [Kitty terminal](https://sw.kovidgoyal.net/kitty/) graphics protocol *(optional — only displays in Kitty)*
 - **commands** — vim-style `:command` interface
 
 no premium. no API keys. no python.
@@ -91,7 +91,14 @@ sudo pacman -S webkit2gtk-4.1 gtk3
 sudo dnf install webkit2gtk4.1-devel gtk3-devel
 ```
 
-When present, `install.sh` will build `txsyxts-login` automatically.
+</details>
+
+<details>
+<summary>optional — album art (Kitty terminal)</summary>
+
+Album art is displayed automatically if you're running inside the [Kitty terminal emulator](https://sw.kovidgoyal.net/kitty/). No extra install needed — just use Kitty.
+
+If you're on a different terminal, album art is simply not shown. Everything else works the same.
 
 </details>
 
@@ -103,7 +110,8 @@ When present, `install.sh` will build `txsyxts-login` automatically.
 | `:search <query>` | search youtube for songs |
 | `:local <path>` | load local audio files |
 | `:pl-create <name>` | create a new local playlist |
-| `:playlists` | list local playlists |
+| `:playlists` / `:playlist` | list local playlists |
+| `:home` | go to home screen |
 | `:pause` / `:p` | toggle pause |
 | `:next` / `:n` | next track |
 | `:prev` | previous track |
@@ -126,7 +134,9 @@ When present, `install.sh` will build `txsyxts-login` automatically.
 |---|---|
 | `j` / `k` | navigate track list |
 | `Enter` | play selected track |
-| `d` / `Delete` | instantly remove song from currently viewed playlist |
+| `a` / `+` | add selected song to a local playlist |
+| `d` / `Delete` | remove song from currently viewed playlist |
+| `Shift+-` (`_`) | remove selected song from current local playlist |
 | `b` | go back to playlists menu |
 | `Space` | toggle pause |
 | `Ctrl+N` | next track |

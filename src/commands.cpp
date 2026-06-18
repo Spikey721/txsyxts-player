@@ -15,7 +15,8 @@ static const std::unordered_map<std::string, std::string> ALIASES = {
 static const std::unordered_set<std::string> COMMANDS = {
     "login", "liked", "play", "pause", "next", "prev", "stop",
     "queue", "vol", "search", "shuffle", "loop", "local", "config",
-    "playlists", "playlist", "ytfzf", "seek", "clear", "help", "quit",
+    "playlists", "playlist", "ytfzf", "seek", "clear", "help", "quit", "home",
+    "pl-create", "pl-add", "pl-remove", "pl-delete",
 };
 
 std::optional<Command> parse_command(const std::string& input) {
@@ -64,6 +65,8 @@ const char* HELP_TEXT =
     "  :pl-remove <name>   remove selected track from playlist\n"
     "  :pl-delete <name>   delete a local playlist\n"
     "  :playlists          list local playlists\n"
+    "  :playlist           alias for :playlists\n"
+    "  :home               go to home screen\n"
     "  :ytfzf <query>      stream via ytfzf directly\n"
     "  :pause / :p         toggle pause\n"
     "  :next / :n          next track\n"
@@ -80,7 +83,8 @@ const char* HELP_TEXT =
     "  :quit / :exit       exit\n"
     "\n"
     "  keys: j/k=navigate  Enter=play  Space=pause\n"
-    "        d/Delete=remove song  b=back to playlists\n"
-    "        Ctrl+N=next  Ctrl+P=prev  Ctrl+Q=quit";
+    "        a/+=add to playlist  d/Del=remove from playlist\n"
+    "        Shift+- (_)=remove song from current playlist\n"
+    "        b=back to playlists  Ctrl+N=next  Ctrl+P=prev  Ctrl+Q=quit";
 
 } // namespace txs
