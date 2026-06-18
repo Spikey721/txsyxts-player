@@ -22,57 +22,78 @@ no premium. no API keys. no python.
 
 ## install
 
-### build dependencies
-
-```bash
-# ubuntu/debian
-sudo apt install build-essential cmake libmpv-dev libcurl4-openssl-dev
-
-# arch linux
-sudo pacman -S base-devel cmake mpv curl
-
-# fedora
-sudo dnf install @development-tools cmake mpv-libs-devel libcurl-devel
-
-# opensuse
-sudo zypper install -t pattern devel_basis
-sudo zypper install cmake mpv-devel libcurl-devel
-```
-
-### runtime dependencies
-
-```bash
-# ubuntu/debian
-sudo apt install mpv
-pip3 install yt-dlp # highly recommended to use pip for the latest yt-dlp
-
-# arch linux
-sudo pacman -S mpv yt-dlp
-
-# fedora
-sudo dnf install mpv yt-dlp
-
-# opensuse
-sudo zypper install mpv yt-dlp
-```
-
-### build & install
-
 ```bash
 git clone <repo>
-cd txsyxts-player
+cd txsyxts-player-v0.1
 chmod +x install.sh
 ./install.sh
 ```
 
-or manually:
-
-```bash
-make build
-sudo make install
-```
+`install.sh` auto-detects your distro (Ubuntu/Debian, Arch, Fedora, openSUSE) and installs **all** required dependencies, then builds and installs the binary. Just run it and follow the prompt.
 
 after install, just run: `txsyxts`
+
+### manual dependency install (if needed)
+
+<details>
+<summary>build dependencies</summary>
+
+```bash
+# ubuntu/debian
+sudo apt install build-essential cmake git pkg-config libmpv-dev libcurl4-openssl-dev
+
+# arch linux
+sudo pacman -S base-devel cmake git pkgconf mpv curl
+
+# fedora
+sudo dnf install @development-tools cmake git pkgconfig mpv-libs-devel libcurl-devel
+
+# opensuse
+sudo zypper install -t pattern devel_basis
+sudo zypper install cmake git pkg-config mpv-devel libcurl-devel
+```
+
+</details>
+
+<details>
+<summary>runtime dependencies</summary>
+
+```bash
+# all distros — use pip for the latest yt-dlp
+pip3 install yt-dlp
+
+# ubuntu/debian
+sudo apt install mpv
+
+# arch linux
+sudo pacman -S mpv
+
+# fedora
+sudo dnf install mpv
+
+# opensuse
+sudo zypper install mpv
+```
+
+</details>
+
+<details>
+<summary>optional — browser login helper (webkit2gtk)</summary>
+
+```bash
+# ubuntu/debian
+sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev
+
+# arch linux
+sudo pacman -S webkit2gtk-4.1 gtk3
+
+# fedora
+sudo dnf install webkit2gtk4.1-devel gtk3-devel
+```
+
+When present, `install.sh` will build `txsyxts-login` automatically.
+
+</details>
 
 ## commands
 
