@@ -19,7 +19,7 @@ minimal tui music player for linux. native c++ binary — just run `txsyxts`.
 
 no premium. no API keys. no python.
 
-![Tame Impala Playback](assets/tame_impala.png)
+![Player2](assets/search_results.png)
 
 ## install
 
