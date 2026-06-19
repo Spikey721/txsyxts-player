@@ -20,3 +20,9 @@ Makefile
 config.json
 playlists.json
 local_playlists.json
+
+# AI Artifacts
+reports/
+ideas_roadmap.md
+compile_commands.json
+

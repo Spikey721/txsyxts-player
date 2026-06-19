@@ -16,10 +16,13 @@ public:
     void pause();
     void stop();
     void seek(double seconds);
+    void seek_absolute(double pos_sec);
 
     // volume
     int volume() const;
     void set_volume(int vol);
+
+    void set_loudnorm(bool enable);
 
     // state
     bool is_playing() const;

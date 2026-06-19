@@ -5,8 +5,11 @@
 #include <array>
 #include <filesystem>
 #include <algorithm>
+#include <thread>
+#include <chrono>
 #include <unistd.h>
 #include <signal.h>
+#include <curl/curl.h>
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
@@ -165,15 +168,33 @@ std::vector<Track> yt_fetch_playlist(const std::string& url, int max_results) {
 }
 
 // ── yt-dlp stream URL extraction ───────────────────────────────
+// Tries multiple format selectors and retries up to 3 times with
+// exponential backoff to handle YouTube rate-limiting and transient failures.
 
 std::string yt_stream_url(const std::string& video_url) {
-    std::string cmd = "yt-dlp -f \"ba/b\" -g --no-warnings -q \""
-                    + video_url + "\" 2>/dev/null";
-    std::string url = exec_cmd(cmd);
-    // trim whitespace
-    while (!url.empty() && (url.back() == '\n' || url.back() == '\r' || url.back() == ' '))
-        url.pop_back();
-    return url;
+    // Format preference: m4a audio → webm audio → any audio → best
+    static const char* fmts[] = {
+        "ba[ext=m4a]/ba[ext=webm]/ba",
+        "bestaudio/best",
+        "b"
+    };
+
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        if (attempt > 0) {
+            // 2s on 1st retry, 4s on 2nd
+            std::this_thread::sleep_for(std::chrono::seconds(2 * attempt));
+        }
+
+        for (const char* fmt : fmts) {
+            std::string cmd = std::string("yt-dlp -f \"") + fmt +
+                              "\" -g --no-warnings -q \"" + video_url + "\" 2>/dev/null";
+            std::string url = exec_cmd(cmd);
+            while (!url.empty() && (url.back() == '\n' || url.back() == '\r' || url.back() == ' '))
+                url.pop_back();
+            if (!url.empty()) return url;
+        }
+    }
+    return "";
 }
 
 // ── ytfzf ──────────────────────────────────────────────────────
@@ -260,4 +281,222 @@ std::vector<Track> scan_local(const std::string& directory) {
     return tracks;
 }
 
+// ── Download ──────────────────────────────────────────────────────────────────
+
+std::string yt_download(const std::string& video_url, const std::string& out_dir) {
+    std::string dir = out_dir;
+    if (dir.empty()) {
+        const char* home = std::getenv("HOME");
+        dir = home ? std::string(home) + "/Music" : "/tmp";
+    }
+    // Create dir if needed
+    fs::create_directories(dir);
+
+    std::string cmd = "yt-dlp -f \"ba[ext=m4a]/ba/b\" --no-warnings -q "
+                      "--output \"" + dir + "/%(artist)s - %(title)s.%(ext)s\" "
+                      "\"" + video_url + "\" 2>/dev/null";
+    // Run and return the output path (we derive it from title after download)
+    int ret = system(cmd.c_str());
+    return ret == 0 ? dir : "";
+}
+
+// ── Lyrics ────────────────────────────────────────────────────────────────────
+// Uses lrclib.net — completely free, no auth, returns plain text lyrics
+
+static size_t lyrics_write_cb(void* c, size_t s, size_t n, void* u) {
+    static_cast<std::string*>(u)->append(static_cast<char*>(c), s * n);
+    return s * n;
+}
+
+static std::string url_encode_simple(const std::string& s) {
+    std::string out;
+    for (unsigned char c : s) {
+        if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~')
+            out += c;
+        else {
+            char buf[4];
+            snprintf(buf, sizeof(buf), "%%%02X", c);
+            out += buf;
+        }
+    }
+    return out;
+}
+
+Lyrics fetch_lyrics(const std::string& artist, const std::string& title) {
+    Lyrics result;
+    if (artist.empty() && title.empty()) {
+        result.plain = "No track info available.";
+        return result;
+    }
+
+    std::string q = artist + " " + title;
+    std::string url = "https://lrclib.net/api/search?q=" + url_encode_simple(q);
+
+    std::string response;
+    CURL* curl = curl_easy_init();
+    if (!curl) {
+        result.plain = "Failed to init curl.";
+        return result;
+    }
+
+    char errbuf[CURL_ERROR_SIZE];
+    errbuf[0] = 0;
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, lyrics_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "txsyxts/0.1");
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L); // Bypass CA cert issues
+    curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
+    
+    CURLcode res = curl_easy_perform(curl);
+    curl_easy_cleanup(curl);
+
+    if (res != CURLE_OK) {
+        result.plain = "Network error: " + std::string(errbuf[0] ? errbuf : curl_easy_strerror(res));
+        return result;
+    }
+    
+    if (response.empty()) {
+        result.plain = "Empty response from lyrics server.";
+        return result;
+    }
+
+    try {
+        auto j = nlohmann::json::parse(response);
+        if (j.is_array() && !j.empty()) {
+            auto first = j[0];
+            if (first.contains("plainLyrics") && !first["plainLyrics"].is_null()) {
+                result.plain = first["plainLyrics"].get<std::string>();
+            }
+            if (first.contains("syncedLyrics") && !first["syncedLyrics"].is_null()) {
+                std::string raw = first["syncedLyrics"].get<std::string>();
+            std::istringstream ss(raw);
+            std::string line;
+            while (std::getline(ss, line)) {
+                auto rb = line.find(']');
+                if (line.size() > 1 && line[0] == '[' && rb != std::string::npos) {
+                    std::string ts = line.substr(1, rb - 1);
+                    std::string text = line.substr(rb + 1);
+                    if (!text.empty() && text[0] == ' ') text = text.substr(1);
+                    
+                    auto colon = ts.find(':');
+                    if (colon != std::string::npos) {
+                        try {
+                            double m = std::stod(ts.substr(0, colon));
+                            double s = std::stod(ts.substr(colon + 1));
+                            result.lines.push_back({m * 60.0 + s, text});
+                        } catch (...) {}
+                    }
+                }
+            }
+            }
+        }
+    } catch (...) {}
+
+    if (result.empty()) {
+        result.plain = "Lyrics not found for: " + artist + " - " + title;
+    }
+    return result;
+}
+
+// ── Podcast RSS ───────────────────────────────────────────────────────────────
+// Minimal XML parser — extracts <item> blocks and reads title + enclosure url
+
+static std::string xml_extract(const std::string& xml,
+                               const std::string& open_tag,
+                               const std::string& close_tag,
+                               size_t from = 0) {
+    auto start = xml.find(open_tag, from);
+    if (start == std::string::npos) return "";
+    start += open_tag.size();
+    auto end = xml.find(close_tag, start);
+    if (end == std::string::npos) return "";
+    return xml.substr(start, end - start);
+}
+
+static std::string xml_attr(const std::string& tag_text, const std::string& attr) {
+    auto pos = tag_text.find(attr + "=\"");
+    if (pos == std::string::npos) return "";
+    pos += attr.size() + 2;
+    auto end = tag_text.find('"', pos);
+    if (end == std::string::npos) return "";
+    return tag_text.substr(pos, end - pos);
+}
+
+std::vector<Track> fetch_podcast(const std::string& rss_url, int max_episodes) {
+    std::vector<Track> episodes;
+
+    std::string feed;
+    CURL* curl = curl_easy_init();
+    if (!curl) return episodes;
+    curl_easy_setopt(curl, CURLOPT_URL, rss_url.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, lyrics_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &feed);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "txsyxts/0.1");
+    curl_easy_perform(curl);
+    curl_easy_cleanup(curl);
+
+    if (feed.empty()) return episodes;
+
+    // Extract podcast title for artist field
+    std::string podcast_title = xml_extract(feed, "<title>", "</title>");
+    // Strip CDATA if present
+    if (podcast_title.find("<![CDATA[") == 0)
+        podcast_title = podcast_title.substr(9, podcast_title.size() - 12);
+
+    size_t pos = 0;
+    int count = 0;
+    while (count < max_episodes) {
+        auto item_start = feed.find("<item>", pos);
+        if (item_start == std::string::npos) break;
+        auto item_end = feed.find("</item>", item_start);
+        if (item_end == std::string::npos) break;
+        std::string item = feed.substr(item_start, item_end - item_start);
+        pos = item_end + 7;
+
+        Track t;
+        t.source = "podcast";
+        t.artist = podcast_title;
+
+        // Title
+        t.title = xml_extract(item, "<title>", "</title>");
+        if (t.title.find("<![CDATA[") == 0)
+            t.title = t.title.substr(9, t.title.size() - 12);
+
+        // Audio URL from <enclosure url="..." .../>
+        auto enc_pos = item.find("<enclosure");
+        if (enc_pos != std::string::npos) {
+            auto enc_end = item.find("/>", enc_pos);
+            std::string enc_tag = item.substr(enc_pos, enc_end - enc_pos + 2);
+            t.uri = xml_attr(enc_tag, "url");
+        }
+
+        if (t.uri.empty() || t.title.empty()) { pos++; continue; }
+        episodes.push_back(t);
+        ++count;
+    }
+    return episodes;
+}
+
+// ── yt-dlp version check ──────────────────────────────────────────────────────
+
+std::string ytdlp_version() {
+    std::string ver = exec_cmd("yt-dlp --version 2>/dev/null");
+    while (!ver.empty() && (ver.back() == '\n' || ver.back() == '\r' || ver.back() == ' '))
+        ver.pop_back();
+    return ver;
+}
+
+bool ytdlp_is_recent(const std::string& min_version) {
+    std::string ver = ytdlp_version();
+    if (ver.empty()) return false;
+    // yt-dlp versions are YYYY.MM.DD — lexicographic compare works
+    return ver >= min_version;
+}
+
 } // namespace txs
+

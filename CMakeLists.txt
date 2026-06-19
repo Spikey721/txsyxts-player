@@ -26,6 +26,7 @@ FetchContent_MakeAvailable(json)
 
 # ── find system libraries ───────────────────────────────────────
 find_package(PkgConfig REQUIRED)
+find_package(OpenSSL REQUIRED)
 pkg_check_modules(MPV REQUIRED mpv)
 pkg_check_modules(CURL REQUIRED libcurl)
 
@@ -41,6 +42,9 @@ add_executable(txsyxts
   src/app.cpp
   src/ascii_art.cpp
   src/local_playlists.cpp
+  src/history.cpp
+  src/scrobbler.cpp
+  src/sponsorblock.cpp
 )
 
 target_include_directories(txsyxts PRIVATE
@@ -55,6 +59,7 @@ target_link_libraries(txsyxts PRIVATE
   nlohmann_json::nlohmann_json
   ${MPV_LIBRARIES}
   ${CURL_LIBRARIES}
+  OpenSSL::Crypto
   pthread
 )
 

@@ -27,12 +27,19 @@ Player::Player() : impl_(new Impl) {
     mpv_set_option_string(impl_->mpv, "ytdl", "yes");
     mpv_set_option_string(impl_->mpv, "config", "no");
 
+    // Memory optimizations: Increased to 50MB forward / 10MB backward to prevent audio stuttering
+    // while still maintaining a much smaller footprint than MPV's default 150MB+ cache.
+    mpv_set_option_string(impl_->mpv, "cache", "yes");
+    mpv_set_option_string(impl_->mpv, "demuxer-max-bytes", "50000000"); // 50 MB
+    mpv_set_option_string(impl_->mpv, "demuxer-max-back-bytes", "10000000"); // 10 MB
+
     mpv_initialize(impl_->mpv);
 
     mpv_observe_property(impl_->mpv, 0, "playback-time", MPV_FORMAT_DOUBLE);
     mpv_observe_property(impl_->mpv, 0, "duration", MPV_FORMAT_DOUBLE);
     mpv_observe_property(impl_->mpv, 0, "pause", MPV_FORMAT_FLAG);
     mpv_observe_property(impl_->mpv, 0, "idle-active", MPV_FORMAT_FLAG);
+    mpv_observe_property(impl_->mpv, 0, "media-title", MPV_FORMAT_STRING);
 }
 
 Player::~Player() {
@@ -81,6 +88,13 @@ void Player::seek(double seconds) {
     mpv_command(impl_->mpv, cmd);
 }
 
+void Player::seek_absolute(double pos_sec) {
+    if (!impl_->mpv) return;
+    std::string s = std::to_string(pos_sec);
+    const char* args[] = {"seek", s.c_str(), "absolute", nullptr};
+    mpv_command(impl_->mpv, args);
+}
+
 int Player::volume() const {
     if (!impl_->mpv) return 70;
     double vol = 70;
@@ -100,6 +114,15 @@ double Player::position() const { return impl_->pos; }
 double Player::duration() const { return impl_->dur; }
 const std::string& Player::current_title() const { return impl_->title; }
 const std::string& Player::current_artist() const { return impl_->artist; }
+
+void Player::set_loudnorm(bool enable) {
+    if (!impl_->mpv) return;
+    if (enable) {
+        mpv_set_property_string(impl_->mpv, "af", "loudnorm=I=-16:TP=-1.5:LRA=11");
+    } else {
+        mpv_set_property_string(impl_->mpv, "af", "");
+    }
+}
 
 void Player::poll_events() {
     if (!impl_->mpv) return;
@@ -128,6 +151,17 @@ void Player::poll_events() {
                     if (on_track_end) on_track_end();
                 }
                 impl_->idle = idle;
+            } else if (strcmp(prop->name, "media-title") == 0 && prop->format == MPV_FORMAT_STRING) {
+                if (prop->data) {
+                    char* title_str = *static_cast<char**>(prop->data);
+                    if (title_str) {
+                        // Radio stream metadata updates via media-title
+                        std::string mt = title_str;
+                        if (mt != impl_->title && !mt.empty()) {
+                            impl_->title = mt;
+                        }
+                    }
+                }
             }
         }
     }

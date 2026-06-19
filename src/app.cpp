@@ -6,6 +6,9 @@
 #include "queue.hpp"
 #include "commands.hpp"
 #include "local_playlists.hpp"
+#include "history.hpp"
+#include "scrobbler.hpp"
+#include "sponsorblock.hpp"
 
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/screen_interactive.hpp>
@@ -26,6 +29,9 @@
 #include <csignal>
 #include <unistd.h>
 #include <cstdlib>
+#include <unordered_map>
+#include <unordered_set>
+#include <ctime>
 
 using namespace ftxui;
 
@@ -55,15 +61,19 @@ struct AppState {
     Player player;
     Queue queue;
     LocalPlaylists local_playlists;
+    History history;
+    Scrobbler scrobbler;
 
     // UI state
     ViewMode view = ViewMode::Playlists;
     std::string current_local_playlist;
     std::string cmd_input;
-    std::string log_msg = "type :help  ·  :play <query> to search";
+    std::string log_msg = ":play <query>  :search <query>  :help";
     bool log_error = false;
     std::string info_text;
+    Lyrics current_lyrics;
     int selected = 0;
+    std::unordered_set<int> selected_indices;
     int ytfzf_pid = 0;
     bool is_search_queue = false;
 
@@ -73,10 +83,12 @@ struct AppState {
 
     // autoplay & controls
     bool autoplay = true;
+    bool auto_lyrics = false;
     std::string last_artist;
     std::string last_title;
-    std::string loop_btn_text = " 🔁 Loop: Off ";
-    std::string autoplay_btn_text = " ∞ Autoplay: On ";
+    std::string loop_btn_text = " \U0001f501 Loop: Off ";
+    std::string autoplay_btn_text = " \u221e Autoplay: On ";
+    std::string autolyrics_btn_text = " ♫ Lyrics: Off ";
 
     // UI elements
     std::vector<std::string> pl_names;
@@ -98,15 +110,40 @@ struct AppState {
     bool modal_is_input = false;
     std::function<void()> on_modal_submit;
 
+    // Stream URL cache: video URI -> direct CDN stream URL
+    std::unordered_map<std::string, std::string> stream_cache;
+    std::string prefetch_uri; // URI currently being pre-fetched
+
+    // Autoplay: set of URIs played this session to avoid repeats
+    std::unordered_set<std::string> played_uris;
+
+    // SponsorBlock segments for currently playing video
+    std::vector<SponsorSegment> sponsor_segments;
+    std::string sponsor_video_id;
+
+    // Last.fm scrobbling
+    std::time_t track_started_at = 0;
+    bool scrobbled_current = false;
+
+    // yt-dlp version warning (set at startup)
+    std::string ytdlp_warn;
+
+    // Download status line
+    std::string download_status;
+
+    // Layout box for progress bar clicks
+    ftxui::Box progress_box;
+
     void set_log(const std::string& msg, bool err = false) {
         log_msg = msg;
         log_error = err;
     }
 };
 
+
 // ── command handlers ───────────────────────────────────────────
 
-static void play_track(AppState& st, const Track& track, ftxui::ScreenInteractive* screen = nullptr);
+static void play_track(AppState& st, const Track& track, ftxui::ScreenInteractive* screen = nullptr, int skip_count = 0);
 static void update_ascii_art(AppState& st, const Track& track, ftxui::ScreenInteractive& screen);
 
 static void handle_command(AppState& st, const std::string& raw,
@@ -343,6 +380,7 @@ static void handle_command(AppState& st, const std::string& raw,
 
     } else if (name == "stop") {
         st.player.stop();
+        st.current_lyrics = Lyrics();
         if (st.ytfzf_pid > 0) { kill(st.ytfzf_pid, SIGTERM); st.ytfzf_pid = 0; }
         st.set_log("stopped");
 
@@ -357,9 +395,27 @@ static void handle_command(AppState& st, const std::string& raw,
             st.set_log("volume: " + std::to_string(v));
         }
 
+    } else if (name == "radio") {
+        st.set_log("loading radio paradise flac channels...");
+        std::vector<Track> rp_tracks = {
+            {"Radio Paradise (Main)", "FLAC Stream", "", 0, "podcast", "http://stream.radioparadise.com/flacm", ""},
+            {"Radio Paradise (Mellow)", "FLAC Stream", "", 0, "podcast", "http://stream.radioparadise.com/mellow-flac", ""},
+            {"Radio Paradise (Rock)", "FLAC Stream", "", 0, "podcast", "http://stream.radioparadise.com/rock-flac", ""},
+            {"Radio Paradise (World)", "FLAC Stream", "", 0, "podcast", "http://stream.radioparadise.com/world-etc-flac", ""}
+        };
+        st.queue.load(rp_tracks);
+        st.is_search_queue = false;
+        st.current_local_playlist.clear();
+        st.track_names.clear();
+        for (auto& e : rp_tracks) st.track_names.push_back(e.title);
+        st.view = ViewMode::Tracks;
+        st.selected = 0;
+        st.set_log("loaded 4 Radio Paradise FLAC channels");
+
     } else if (name == "seek") {
         if (args.empty()) { st.set_log("usage: :seek <±sec>", true); return; }
         st.player.seek(std::stod(args));
+
 
     } else if (name == "shuffle") {
         bool on = st.queue.toggle_shuffle();
@@ -372,6 +428,18 @@ static void handle_command(AppState& st, const std::string& raw,
     } else if (name == "queue") {
         st.info_text.clear();
 
+    } else if (name == "loudnorm") {
+        bool current = false;
+        // Note: keeping it simple by just toggling, proper state would be in config
+        if (st.log_msg.find("ON") != std::string::npos) current = true;
+        if (!current) {
+            st.player.set_loudnorm(true);
+            st.set_log("audio normalization: ON");
+        } else {
+            st.player.set_loudnorm(false);
+            st.set_log("audio normalization: OFF");
+        }
+
     } else if (name == "pl-create") {
         if (args.empty()) { st.set_log("usage: :pl-create <name>", true); return; }
         if (st.local_playlists.create(args)) st.set_log("created local playlist: " + args);
@@ -380,9 +448,20 @@ static void handle_command(AppState& st, const std::string& raw,
     } else if (name == "pl-add") {
         if (args.empty()) { st.set_log("usage: :pl-add <name>", true); return; }
         if (st.view == ViewMode::Tracks && !st.queue.empty()) {
-            auto& t = st.queue.tracks()[st.selected];
-            if (st.local_playlists.add_track(args, t)) st.set_log("added to " + args);
-            else st.set_log("failed to add track", true);
+            if (!st.selected_indices.empty()) {
+                int count = 0;
+                for (int idx : st.selected_indices) {
+                    if (idx >= 0 && idx < st.queue.length()) {
+                        if (st.local_playlists.add_track(args, st.queue.tracks()[idx])) count++;
+                    }
+                }
+                st.selected_indices.clear();
+                st.set_log("added " + std::to_string(count) + " tracks to " + args);
+            } else {
+                auto& t = st.queue.tracks()[st.selected];
+                if (st.local_playlists.add_track(args, t)) st.set_log("added to " + args);
+                else st.set_log("failed to add track", true);
+            }
         } else {
             st.set_log("select a track first", true);
         }
@@ -421,30 +500,320 @@ static void handle_command(AppState& st, const std::string& raw,
         st.track_names.clear();
         st.info_text.clear();
         st.set_log("cleared");
+
+    } else if (name == "find") {
+        if (args.empty()) { st.set_log("usage: :find <text>", true); return; }
+        if (st.view != ViewMode::Tracks && st.view != ViewMode::Playlists) {
+            st.set_log("not in a list view", true);
+            return;
+        }
+        auto& list = (st.view == ViewMode::Tracks) ? st.track_names : st.pl_names;
+        std::string q = args;
+        std::transform(q.begin(), q.end(), q.begin(), ::tolower);
+        bool found = false;
+        for (size_t i = 0; i < list.size(); ++i) {
+            std::string item = list[i];
+            std::transform(item.begin(), item.end(), item.begin(), ::tolower);
+            if (item.find(q) != std::string::npos) {
+                if (st.view == ViewMode::Tracks) st.selected = i;
+                else st.pl_selected = i;
+                st.set_log("found: " + list[i]);
+                found = true;
+                break;
+            }
+        }
+        if (!found) st.set_log("no match for: " + args, true);
+
+
+    } else if (name == "history") {
+        auto entries = st.history.get_recent(50);
+        if (entries.empty()) { st.info_text = "No play history yet."; }
+        else {
+            std::string text = "Recent plays:\n\n";
+            for (auto& e : entries) {
+                char buf[32];
+                struct tm* tmi = localtime(&e.played_at);
+                strftime(buf, sizeof(buf), "%m/%d %H:%M", tmi);
+                text += std::string(buf) + "  " + e.track.display() + "\n";
+            }
+            st.info_text = text;
+        }
+        st.view = ViewMode::Info;
+
+    } else if (name == "lyrics") {
+        std::string artist = st.player.current_artist();
+        std::string title  = st.player.current_title();
+        
+        // If mpv extracted a garbage URL string or missing artist, fall back to queue
+        bool mpv_garbage = title.find("=") != std::string::npos || title.find("http") == 0 || title.find(".mp4") != std::string::npos;
+        
+        if (mpv_garbage || artist.empty()) {
+            if (!st.queue.empty()) {
+                int ci = st.queue.current_index();
+                if (ci >= 0 && ci < st.queue.length()) {
+                    artist = st.queue.tracks()[ci].artist;
+                    title = st.queue.tracks()[ci].title;
+                }
+            }
+        }
+        
+        if (title.empty()) { st.set_log("nothing playing", true); return; }
+        st.set_log("fetching lyrics...");
+        std::thread([&st, &screen, artist, title]() {
+            Lyrics lyr = fetch_lyrics(artist, title);
+            std::lock_guard<std::mutex> lk(st.mtx);
+            if (lyr.plain.find("Lyrics not found") != std::string::npos || lyr.plain.find("Network error") != std::string::npos) {
+                st.set_log(lyr.plain, true);
+            } else {
+                st.current_lyrics = lyr;
+                st.info_text = lyr.plain;
+                st.set_log("lyrics loaded");
+                if (lyr.lines.empty()) {
+                    st.view = ViewMode::Info;
+                }
+            }
+            screen.Post(Event::Custom);
+        }).detach();
+
+    } else if (name == "download") {
+        std::string url;
+        if (!args.empty()) { url = args; }
+        else if (!st.queue.empty()) {
+            int ci = st.queue.current_index();
+            if (ci < 0) ci = st.selected;
+            if (ci >= 0 && ci < st.queue.length()) url = st.queue.tracks()[ci].uri;
+        }
+        if (url.empty()) { st.set_log("usage: :download <url>  or select a youtube track", true); return; }
+        st.set_log("downloading to ~/Music/ ...");
+        std::thread([&st, &screen, url]() {
+            std::string dir = yt_download(url);
+            std::lock_guard<std::mutex> lk(st.mtx);
+            st.set_log(dir.empty() ? "download failed" : "downloaded to " + dir, dir.empty());
+            screen.Post(Event::Custom);
+        }).detach();
+
+    } else if (name == "podcast") {
+        if (args.empty()) { st.set_log("usage: :podcast <rss-url>", true); return; }
+        st.set_log("loading podcast...");
+        std::string rss = args;
+        std::thread([&st, &screen, rss]() {
+            auto eps = fetch_podcast(rss, 30);
+            std::lock_guard<std::mutex> lk(st.mtx);
+            if (eps.empty()) { st.set_log("no episodes found", true); }
+            else {
+                st.queue.load(eps);
+                st.is_search_queue = false;
+                st.current_local_playlist.clear();
+                st.track_names.clear();
+                for (auto& e : eps) st.track_names.push_back(e.title);
+                st.view = ViewMode::Tracks;
+                st.selected = 0;
+                st.set_log("loaded " + std::to_string(eps.size()) + " episodes");
+            }
+            screen.Post(Event::Custom);
+        }).detach();
+
+    } else if (name == "pl-rename") {
+        auto sp = args.find(' ');
+        if (sp == std::string::npos) { st.set_log("usage: :pl-rename <old> <new>", true); return; }
+        std::string old_name = args.substr(0, sp);
+        std::string new_name = args.substr(sp + 1);
+        if (st.local_playlists.rename(old_name, new_name)) {
+            if (st.current_local_playlist == old_name) st.current_local_playlist = new_name;
+            st.set_log("renamed to: " + new_name);
+        } else {
+            st.set_log("rename failed (not found or name taken)", true);
+        }
+
+    } else if (name == "pl-export") {
+        if (args.empty()) { st.set_log("usage: :pl-export <playlist-name>", true); return; }
+        const char* home = std::getenv("HOME");
+        std::string out = (home ? std::string(home) : "/tmp") + "/" + args + ".m3u8";
+        if (st.local_playlists.export_m3u(args, out))
+            st.set_log("exported to " + out);
+        else
+            st.set_log("export failed: \"" + args + "\" not found", true);
+
+    } else if (name == "tag") {
+        if (args.empty()) { st.set_log("usage: :tag <label>", true); return; }
+        std::string uri;
+        if (!st.queue.empty()) {
+            int ci = st.queue.current_index(); if (ci < 0) ci = st.selected;
+            if (ci >= 0 && ci < st.queue.length()) uri = st.queue.tracks()[ci].uri;
+        }
+        if (uri.empty()) { st.set_log("select a track first", true); return; }
+        st.local_playlists.add_tag(uri, args);
+        st.set_log("tagged: " + args);
+
+    } else if (name == "untag") {
+        if (args.empty()) { st.set_log("usage: :untag <label>", true); return; }
+        std::string uri;
+        if (!st.queue.empty()) {
+            int ci = st.queue.current_index(); if (ci < 0) ci = st.selected;
+            if (ci >= 0 && ci < st.queue.length()) uri = st.queue.tracks()[ci].uri;
+        }
+        if (uri.empty()) { st.set_log("select a track first", true); return; }
+        st.local_playlists.remove_tag(uri, args);
+        st.set_log("removed tag: " + args);
+
+    } else if (name == "tagged") {
+        if (args.empty()) { st.set_log("usage: :tagged <label>", true); return; }
+        auto tracks = st.local_playlists.get_tagged(args);
+        if (tracks.empty()) { st.set_log("no tracks tagged: " + args, true); return; }
+        st.queue.load(tracks);
+        st.is_search_queue = false;
+        st.current_local_playlist.clear();
+        st.track_names.clear();
+        for (auto& t : tracks) st.track_names.push_back(t.title);
+        st.view = ViewMode::Tracks;
+        st.selected = 0;
+        st.set_log("tagged \"" + args + "\": " + std::to_string(tracks.size()) + " tracks");
+
+    } else if (name == "tags") {
+        auto all = st.local_playlists.all_tags();
+        st.info_text = all.empty() ? "No tags yet.\n\nUse :tag <label> on a selected track." :
+                       "All tags:\n\n";
+        for (auto& t : all) st.info_text += "  " + t + "\n";
+        st.view = ViewMode::Info;
+
+    } else if (name == "update") {
+        st.set_log("updating yt-dlp...");
+        std::thread([&st, &screen]() {
+            int ret = system("pip install -U yt-dlp 2>/dev/null || pip3 install -U yt-dlp 2>/dev/null");
+            std::lock_guard<std::mutex> lk(st.mtx);
+            if (ret == 0) { st.ytdlp_warn.clear(); st.set_log("yt-dlp updated: " + ytdlp_version()); }
+            else st.set_log("update failed — try: pip install -U yt-dlp", true);
+            screen.Post(Event::Custom);
+        }).detach();
+
+    } else if (name == "sponsorblock") {
+        if (args == "on" || args == "off") {
+            st.config.sponsorblock_enabled = (args == "on");
+            st.config.save();
+        }
+        st.set_log(std::string("sponsorblock: ") + (st.config.sponsorblock_enabled ? "on" : "off"));
+
+    } else if (name == "scrobble") {
+        if (args == "on" || args == "off") {
+            st.config.scrobble_enabled = (args == "on");
+            st.config.save();
+        }
+        st.set_log(std::string("scrobbling: ") + (st.config.scrobble_enabled ? "on" : "off") +
+                   " | configured: " + (st.scrobbler.is_configured() ? "yes" : "no"));
     }
 }
 
-// ── play a track (resolve spotify→youtube if needed) ──────────
 
-static void play_track(AppState& st, const Track& track, ftxui::ScreenInteractive* screen) {
-    if (track.source == "local") {
+// ── Pre-fetch, notify, scrobble, sponsorblock helpers ─────────────────────────
+
+static void prefetch_next(AppState& st, ftxui::ScreenInteractive* screen) {
+    int next_idx = st.queue.current_index() + 1;
+    if (next_idx < 0 || next_idx >= st.queue.length()) return;
+    const Track& next = st.queue.tracks()[next_idx];
+    if (next.source != "youtube" || next.uri.empty()) return;
+    if (st.stream_cache.count(next.uri)) return;
+    if (st.prefetch_uri == next.uri) return;
+
+    std::string uri = next.uri;
+    st.prefetch_uri = uri;
+    std::thread([&st, screen, uri]() {
+        std::string url = yt_stream_url(uri);
+        std::lock_guard<std::mutex> lk(st.mtx);
+        if (!url.empty()) { st.stream_cache[uri] = url; }
+        st.prefetch_uri.clear();
+        if (screen) screen->Post(Event::Custom);
+    }).detach();
+}
+
+static void notify_track(const Track& t) {
+    std::string body = t.artist.empty() ? t.title : t.artist + " \xe2\x80\x94 " + t.title;
+    for (auto& c : body) if (c == '"') c = '\'';
+    system(("notify-send -t 4000 -i audio-x-generic \"txsyxts\" \"" + body + "\" 2>/dev/null &").c_str());
+}
+
+static void on_track_started(AppState& st, const Track& t,
+                              ftxui::ScreenInteractive* screen,
+                              const std::string& stream_url) {
+    st.history.record(t);
+    if (!t.uri.empty()) st.played_uris.insert(t.uri);
+    if (st.config.notify_enabled) notify_track(t);
+
+    st.track_started_at = std::time(nullptr);
+    st.scrobbled_current = false;
+    if (st.config.scrobble_enabled && st.scrobbler.is_configured())
+        st.scrobbler.now_playing(t);
+
+    st.current_lyrics = Lyrics();
+    if (st.auto_lyrics) {
+        // Automatically invoke the lyrics fetcher
+        handle_command(st, "lyrics", *screen);
+    }
+
+    // Fetch SponsorBlock segments in background
+    if (st.config.sponsorblock_enabled) {
+        std::string video_url = t.uri.empty() ? stream_url : t.uri;
+        std::string vid = yt_video_id(video_url);
+        if (!vid.empty() && vid != st.sponsor_video_id) {
+            std::thread([&st, vid]() {
+                auto segs = sponsorblock_get(vid);
+                std::lock_guard<std::mutex> lk(st.mtx);
+                st.sponsor_segments = segs;
+                st.sponsor_video_id = vid;
+            }).detach();
+        }
+    }
+
+    prefetch_next(st, screen);
+    int ci = st.queue.current_index();
+    if (ci >= 0) st.selected = ci;
+}
+
+// ── play a track (resolve spotify→youtube if needed) ──────────
+// skip_count: number of tracks auto-skipped so far due to failure.
+// Capped at 3 to avoid an infinite skip loop on a dead queue.
+
+static void play_track(AppState& st, const Track& track, ftxui::ScreenInteractive* screen, int skip_count) {
+    if (track.source == "local" || track.source == "podcast") {
         st.player.play(track.uri, track.title, track.artist);
-        st.set_log("▶ " + track.display());
+        st.set_log("\u25b6 " + track.display());
+        on_track_started(st, track, screen, track.uri);
         return;
     }
 
     if (track.source == "youtube" && !track.uri.empty()) {
+        // Check stream cache first — instant start if pre-fetched
+        auto cached = st.stream_cache.find(track.uri);
+        if (cached != st.stream_cache.end() && !cached->second.empty()) {
+            st.player.play(cached->second, track.title, track.artist);
+            st.set_log("\u25b6 " + track.display() + " (instant)");
+            on_track_started(st, track, screen, cached->second);
+            if (screen) screen->Post(Event::Custom);
+            return;
+        }
+
         st.set_log("resolving stream: " + track.title + "...");
         if (screen) screen->Post(Event::Custom);
         Track t_copy = track;
-        std::thread([&st, screen, t_copy]() {
+        std::thread([&st, screen, t_copy, skip_count]() {
             std::string stream_url = yt_stream_url(t_copy.uri);
             std::lock_guard<std::mutex> lk(st.mtx);
             if (!stream_url.empty()) {
+                st.stream_cache[t_copy.uri] = stream_url;
                 st.player.play(stream_url, t_copy.title, t_copy.artist);
-                st.set_log("▶ " + t_copy.display());
+                st.set_log("\u25b6 " + t_copy.display());
+                on_track_started(st, t_copy, screen, stream_url);
+            } else if (skip_count < 3) {
+                st.set_log("skipping (unavailable): " + t_copy.title + "...", true);
+                auto next = st.queue.next();
+                if (next) {
+                    int ci = st.queue.current_index();
+                    if (ci >= 0) st.selected = ci;
+                    play_track(st, *next, screen, skip_count + 1);
+                } else {
+                    st.set_log("queue ended");
+                }
             } else {
-                st.set_log("failed to extract stream: " + t_copy.display(), true);
+                st.set_log("too many failures in a row \u2014 stopping", true);
             }
             if (screen) screen->Post(Event::Custom);
         }).detach();
@@ -454,20 +823,32 @@ static void play_track(AppState& st, const Track& track, ftxui::ScreenInteractiv
     // spotify → search youtube
     st.set_log("finding: " + track.search_query() + "...");
     if (screen) screen->Post(Event::Custom);
-    
+
     std::string q = track.search_query();
-    Track t_copy = track; // capture by value for thread
-    
-    std::thread([&st, screen, q, t_copy]() {
+    Track t_copy = track;
+
+    std::thread([&st, screen, q, t_copy, skip_count]() {
         auto tracks = yt_search(q, 1);
         if (!tracks.empty() && !tracks[0].uri.empty()) {
             std::string stream_url = yt_stream_url(tracks[0].uri);
             std::lock_guard<std::mutex> lk(st.mtx);
             if (!stream_url.empty()) {
+                st.stream_cache[t_copy.uri] = stream_url;
                 st.player.play(stream_url, t_copy.title, t_copy.artist);
-                st.set_log("▶ " + t_copy.display());
+                st.set_log("\u25b6 " + t_copy.display());
+                on_track_started(st, t_copy, screen, stream_url);
+            } else if (skip_count < 3) {
+                st.set_log("skipping (unavailable): " + t_copy.title + "...", true);
+                auto next = st.queue.next();
+                if (next) {
+                    int ci = st.queue.current_index();
+                    if (ci >= 0) st.selected = ci;
+                    play_track(st, *next, screen, skip_count + 1);
+                } else {
+                    st.set_log("queue ended");
+                }
             } else {
-                st.set_log("failed to extract stream: " + t_copy.display(), true);
+                st.set_log("too many failures in a row \u2014 stopping", true);
             }
         } else {
             std::lock_guard<std::mutex> lk(st.mtx);
@@ -476,6 +857,8 @@ static void play_track(AppState& st, const Track& track, ftxui::ScreenInteractiv
         if (screen) screen->Post(Event::Custom);
     }).detach();
 }
+
+
 
 static void update_ascii_art(AppState& st, const Track& track, ftxui::ScreenInteractive& screen) {
     if (track.thumbnail_url.empty()) {
@@ -509,6 +892,14 @@ int run_app() {
     st.spotify.set_sp_dc(st.config.sp_dc);
     st.player.set_volume(st.config.volume);
 
+    // yt-dlp version check background
+    std::thread([&st]() {
+        if (!ytdlp_is_recent("2024.11.18")) {
+            std::lock_guard<std::mutex> lk(st.mtx);
+            st.ytdlp_warn = "yt-dlp is outdated! Run :update or some streams may fail.";
+        }
+    }).detach();
+
     // Initial population of local playlists
     st.playlists.clear();
     st.pl_names.clear();
@@ -524,7 +915,7 @@ int run_app() {
         // save what was playing for recommendations
         st.last_artist = st.player.current_artist();
         st.last_title = st.player.current_title();
-        
+
         std::string last_uri;
         if (!st.queue.empty()) {
             last_uri = st.queue.tracks()[st.queue.current_index()].uri;
@@ -536,22 +927,37 @@ int run_app() {
             update_ascii_art(st, *t, screen);
         } else if (st.autoplay && !last_uri.empty()) {
             // queue ended — get recommendations from YouTube Mix
-            st.set_log("⟳ finding similar songs...");
+            st.set_log("\u27f3 finding similar songs...");
             screen.Post(Event::Custom);
 
             std::thread([&st, &screen, last_uri]() {
                 auto recs = yt_get_similar(last_uri, 5);
                 if (!recs.empty()) {
                     std::lock_guard<std::mutex> lk(st.mtx);
-                    
-                    // Filter out the exact song that just played (often index 0 in the mix)
+
+                    // Filter out recently played tracks to avoid loops
                     std::vector<Track> filtered;
                     for (auto& r : recs) {
-                        if (r.uri != last_uri) {
+                        if (st.played_uris.count(r.uri) == 0 && r.uri != last_uri) {
                             filtered.push_back(r);
                         }
                     }
-                    
+
+                    // Fallback to recent history recommendations if mix is exhausted
+                    if (filtered.empty()) {
+                        auto hist_uris = st.history.get_recent_uris(5);
+                        for (auto& hu : hist_uris) {
+                            auto hist_recs = yt_get_similar(hu, 5);
+                            for (auto& hr : hist_recs) {
+                                if (st.played_uris.count(hr.uri) == 0) {
+                                    filtered.push_back(hr);
+                                    break;
+                                }
+                            }
+                            if (!filtered.empty()) break;
+                        }
+                    }
+
                     if (!filtered.empty()) {
                         st.queue.load(filtered);
                         st.track_names.clear();
@@ -561,10 +967,10 @@ int run_app() {
                         if (first) {
                             play_track(st, *first, &screen);
                             update_ascii_art(st, *first, screen);
-                            st.set_log("⟳ autoplay: " + first->display());
+                            st.set_log("\u27f3 autoplay: " + first->display());
                         }
                     } else {
-                        st.set_log("autoplay: no new similar songs found", true);
+                        st.set_log("autoplay: no new unplayed similar songs found", true);
                     }
                 } else {
                     std::lock_guard<std::mutex> lk(st.mtx);
@@ -582,27 +988,34 @@ int run_app() {
     std::string input_str;
     auto input = Input(&input_str, ":");
 
-    auto btn_prev = Button(" ⏮  ", [&]{ auto t = st.queue.prev(); if(t){ play_track(st, *t, &screen); update_ascii_art(st, *t, screen); } }, ButtonOption::Animated(Color::GrayDark, Color::GrayLight, Color::White, Color::White));
-    auto btn_play = Button(" ⏯  ", [&]{ st.player.pause(); }, ButtonOption::Animated(Color::RGB(152, 195, 121), Color::RGB(152, 195, 121), Color::White, Color::White));
-    auto btn_next = Button(" ⏭  ", [&]{ auto t = st.queue.next(); if(t){ play_track(st, *t, &screen); update_ascii_art(st, *t, screen); } }, ButtonOption::Animated(Color::GrayDark, Color::GrayLight, Color::White, Color::White));
-    
-    auto btn_loop = Button(&st.loop_btn_text, [&]{ 
-        st.queue.cycle_loop(); 
-        st.set_log("loop: " + st.queue.loop_str()); 
-        st.loop_btn_text = " 🔁 Loop: " + st.queue.loop_str() + " ";
-    }, ButtonOption::Animated(Color::GrayDark, Color::GrayLight, Color::White, Color::White));
-    
-    auto btn_autoplay = Button(&st.autoplay_btn_text, [&]{ 
-        st.autoplay = !st.autoplay; 
-        st.set_log(std::string("autoplay: ") + (st.autoplay ? "on" : "off")); 
-        st.autoplay_btn_text = " ∞ Autoplay: " + std::string(st.autoplay ? "On " : "Off ");
+    auto btn_prev = Button(" \u23ee  ", [&]{ auto t = st.queue.prev(); if(t){ play_track(st, *t, &screen); update_ascii_art(st, *t, screen); } }, ButtonOption::Animated(Color::GrayDark, Color::GrayLight, Color::White, Color::White));
+    auto btn_play = Button(" \u23ef  ", [&]{ st.player.pause(); }, ButtonOption::Animated(Color::RGB(152, 195, 121), Color::RGB(152, 195, 121), Color::White, Color::White));
+    auto btn_next = Button(" \u23ed  ", [&]{ auto t = st.queue.next(); if(t){ play_track(st, *t, &screen); update_ascii_art(st, *t, screen); } }, ButtonOption::Animated(Color::GrayDark, Color::GrayLight, Color::White, Color::White));
+
+    auto btn_loop = Button(&st.loop_btn_text, [&]{
+        st.queue.cycle_loop();
+        st.set_log("loop: " + st.queue.loop_str());
+        st.loop_btn_text = " \U0001f501 Loop: " + st.queue.loop_str() + " ";
     }, ButtonOption::Animated(Color::GrayDark, Color::GrayLight, Color::White, Color::White));
 
-    auto controls = Container::Horizontal({ btn_prev, btn_play, btn_next, btn_loop, btn_autoplay });
+    auto btn_autoplay = Button(&st.autoplay_btn_text, [&]{
+        st.autoplay = !st.autoplay;
+        st.set_log(std::string("autoplay: ") + (st.autoplay ? "on" : "off"));
+        st.autoplay_btn_text = " \u221e Autoplay: " + std::string(st.autoplay ? "On " : "Off ");
+    }, ButtonOption::Animated(Color::GrayDark, Color::GrayLight, Color::White, Color::White));
+
+    auto btn_autolyrics = Button(&st.autolyrics_btn_text, [&]{
+        st.auto_lyrics = !st.auto_lyrics;
+        st.set_log(std::string("auto lyrics: ") + (st.auto_lyrics ? "on" : "off"));
+        st.autolyrics_btn_text = " ♫ Lyrics: " + std::string(st.auto_lyrics ? "On " : "Off ");
+        if (st.auto_lyrics && st.current_lyrics.lines.empty() && st.info_text.empty() && !st.player.current_title().empty()) {
+            handle_command(st, "lyrics", screen);
+        }
+    }, ButtonOption::Animated(Color::GrayDark, Color::GrayLight, Color::White, Color::White));
+
+    auto controls = Container::Horizontal({ btn_prev, btn_play, btn_next, btn_loop, btn_autoplay, btn_autolyrics });
 
     MenuOption track_opt;
-    // on_enter intentionally left as no-op — Enter is handled exclusively
-    // by the CatchEvent handler below to avoid double-triggering play.
     track_opt.on_enter = [] {};
     track_opt.entries_option.transform = [&](const EntryState& state) {
         bool focused = state.focused;
@@ -610,7 +1023,7 @@ int run_app() {
             auto& pl = st.playlists[state.index];
             bool active = (state.index == st.pl_selected);
             char idx[16]; snprintf(idx, sizeof(idx), "%3d", state.index + 1);
-            std::string prefix = active ? "▶" : " ";
+            std::string prefix = active ? "\u25b6" : " ";
             auto row = hbox({
                 text(prefix + " " + std::string(idx) + "  ") | color(Color::GrayDark),
                 text(pl.first) | (active ? bold : nothing) | color(active ? Color::RGB(152, 195, 121) : Color::GrayLight)
@@ -622,7 +1035,8 @@ int run_app() {
             auto& t = st.queue.tracks()[state.index];
             bool playing = (state.index == st.queue.current_index());
             bool active = (state.index == st.selected);
-            std::string marker = playing ? "▶" : " ";
+            std::string marker = playing ? "\u25b6" : " ";
+            if (st.selected_indices.count(state.index)) marker = "[✓]";
             char idx[16]; snprintf(idx, sizeof(idx), "%3d", state.index + 1);
             std::string dur = t.duration_str();
             std::string artist_s = t.artist.empty() ? "" : "  " + t.artist;
@@ -655,11 +1069,34 @@ int run_app() {
         // poll mpv events
         st.player.poll_events();
 
+        // Check SponsorBlock
+        if (st.config.sponsorblock_enabled && st.player.is_playing() && !st.sponsor_segments.empty()) {
+            double pos = st.player.position();
+            double skip_to = sponsorblock_should_skip(pos, st.sponsor_segments);
+            if (skip_to > 0) {
+                st.player.seek_absolute(skip_to);
+                st.set_log("SponsorBlock: skipped to " + fmt_time(skip_to));
+            }
+        }
+
+        // Check Last.fm Scrobble (scrobble after 50% or 4 minutes)
+        if (st.config.scrobble_enabled && st.player.is_playing() && !st.scrobbled_current && st.track_started_at > 0) {
+            double pos = st.player.position();
+            double dur = st.player.duration();
+            int elapsed = std::time(nullptr) - st.track_started_at;
+            if ((dur > 0 && pos > dur * 0.5) || elapsed > 240) {
+                int ci = st.queue.current_index();
+                if (ci >= 0 && ci < st.queue.length()) {
+                    st.scrobbler.scrobble(st.queue.tracks()[ci], st.track_started_at);
+                    st.scrobbled_current = true;
+                }
+            }
+        }
+
         // ── header ─────────────────────────────────────────────
         std::string status;
-        if (st.spotify.is_logged_in()) status += "spotify ✓  ";
-        // if (ytfzf_available()) status += "ytfzf ✓  ";
-        status += "mpv ✓";
+        if (st.spotify.is_logged_in()) status += "spotify \u2713  ";
+        status += "mpv \u2713";
 
         auto header = hbox({
             text("txsyxts") | bold | color(Color::RGB(152, 195, 121)),
@@ -670,13 +1107,13 @@ int run_app() {
         // ── track list or info ─────────────────────────────────
         Element body;
         if (st.view == ViewMode::Info && !st.info_text.empty()) {
-            body = paragraph(st.info_text) | color(Color::GrayLight);
+            body = paragraph(st.info_text) | color(Color::GrayLight) | vscroll_indicator | yframe;
         } else if (st.view == ViewMode::Playlists && !st.playlists.empty()) {
             body = menu_pl->Render() | vscroll_indicator | yframe;
         } else if (st.view == ViewMode::Home || st.queue.empty()) {
             body = vbox({
                 text("") | size(HEIGHT, EQUAL, 2),
-                text("  :help for commands  ·  :login to connect spotify  ·  :search <query>")
+                text("  j/k=navigate  Enter=play  a=add to playlist  :search <query>  :help")
                     | center | color(Color::GrayDark),
             });
         } else {
@@ -686,6 +1123,17 @@ int run_app() {
         // ── now playing bar ────────────────────────────────────
         std::string np_title = st.player.current_title();
         std::string np_artist = st.player.current_artist();
+        
+        bool np_garbage = np_title.find("=") != std::string::npos || np_title.find("http") == 0 || np_title.find(".mp4") != std::string::npos;
+        if (np_garbage || np_artist.empty()) {
+            if (!st.queue.empty()) {
+                int ci = st.queue.current_index();
+                if (ci >= 0 && ci < st.queue.length()) {
+                    np_artist = st.queue.tracks()[ci].artist;
+                    np_title = st.queue.tracks()[ci].title;
+                }
+            }
+        }
         double pos = st.player.position();
         double dur = st.player.duration();
         int progress = dur > 0 ? (int)(pos / dur * 40) : 0;
@@ -700,7 +1148,13 @@ int run_app() {
         std::string sh_str = st.queue.shuffle() ? "⤮ on" : "";
         std::string lo_str = st.queue.loop() != LoopMode::Off ?
                              ("↻ " + st.queue.loop_str()) : "";
-        std::string vol_str = "vol:" + std::to_string(st.player.volume());
+        
+        int vol_val = st.player.volume();
+        int v_bars = vol_val / 10;
+        if (v_bars > 15) v_bars = 15;
+        std::string v_filled; for(int i=0; i<v_bars; i++) v_filled += "█";
+        std::string v_empty; for(int i=0; i<15-v_bars; i++) v_empty += "░";
+        std::string vol_str = "vol: " + v_filled + v_empty + " " + std::to_string(vol_val);
 
         auto now_playing = vbox({
             hbox({
@@ -718,7 +1172,7 @@ int run_app() {
                 text(" " + fmt_time(dur)) | color(Color::GrayDark),
                 filler(),
                 text(sh_str + "  " + lo_str + "  " + vol_str) | color(Color::GrayDark),
-            }),
+            }) | reflect(st.progress_box),
         });
 
         // ── log bar ────────────────────────────────────────────
@@ -769,12 +1223,35 @@ int run_app() {
             });
         }
 
+        Element lyrics_el = filler();
+        if (!st.current_lyrics.lines.empty()) {
+            Elements l_els;
+            double pos = st.player.position();
+            int active_idx = -1;
+            for (int i = 0; i < (int)st.current_lyrics.lines.size(); ++i) {
+                if (pos >= st.current_lyrics.lines[i].time_sec) active_idx = i;
+            }
+            int start = std::max(0, active_idx - 3);
+            int end = std::min((int)st.current_lyrics.lines.size(), active_idx + 4);
+            for (int i = start; i < end; ++i) {
+                bool active = (i == active_idx);
+                l_els.push_back(text("  " + st.current_lyrics.lines[i].text) 
+                    | (active ? color(Color::RGB(152, 195, 121)) : color(Color::GrayDark))
+                    | (active ? bold : nothing));
+            }
+            lyrics_el = vbox(std::move(l_els)) | center;
+        }
+
+        auto left_panel = vbox({
+            (st.current_art_url.empty() ? logo : (st.current_art | border | bgcolor(Color::RGB(15,15,15)))),
+            filler(),
+            lyrics_el,
+            filler(),
+            viz | center
+        }) | size(WIDTH, EQUAL, 60);
+
         auto main_content = hbox({
-            (st.current_art_url.empty() ? logo : vbox({
-                st.current_art | border | bgcolor(Color::RGB(15,15,15)),
-                filler(),
-                viz | center
-            }) | size(WIDTH, EQUAL, 60)),
+            left_panel,
             right_panel | flex
         });
 
@@ -863,14 +1340,30 @@ int run_app() {
         }
 
         // Enter — submit command
-        if (event == Event::Return) {
+        if (event == Event::Return && !st.show_modal) {
             if (!input_str.empty()) {
                 std::string cmd = input_str;
                 input_str.clear();
                 handle_command(st, cmd, screen);
-            } else {
-                // Play currently selected track on Enter
-                if (st.view == ViewMode::Tracks && !st.queue.empty()) {
+                return true;
+            } else if (st.view == ViewMode::Tracks && !st.queue.empty()) {
+                if (!st.selected_indices.empty()) {
+                    std::vector<Track> selected_tracks;
+                    std::vector<int> sorted_idx(st.selected_indices.begin(), st.selected_indices.end());
+                    std::sort(sorted_idx.begin(), sorted_idx.end());
+                    for (int i : sorted_idx) {
+                        if (i >= 0 && i < st.queue.length()) selected_tracks.push_back(st.queue.tracks()[i]);
+                    }
+                    st.queue.load(selected_tracks);
+                    st.track_names.clear();
+                    for (auto& t : selected_tracks) st.track_names.push_back(t.title);
+                    st.selected_indices.clear();
+                    st.selected = 0;
+                    st.queue.jump(0);
+                    play_track(st, st.queue.tracks()[0], &screen);
+                    update_ascii_art(st, st.queue.tracks()[0], screen);
+                    st.set_log("playing selected batch");
+                } else {
                     auto t = st.queue.jump(st.selected);
                     if (t) {
                         if (st.autoplay && st.is_search_queue) {
@@ -905,7 +1398,9 @@ int run_app() {
                         play_track(st, *t, &screen);
                         update_ascii_art(st, *t, screen);
                     }
-                } else if (st.view == ViewMode::Playlists && !st.playlists.empty()) {
+                }
+                return true;
+            } else if (st.view == ViewMode::Playlists && !st.playlists.empty()) {
                     auto pl = st.playlists[st.pl_selected];
                     st.set_log("loading playlist: " + pl.first + "...");
                     screen.Post(Event::Custom);
@@ -933,7 +1428,6 @@ int run_app() {
                         st.set_log("loaded " + std::to_string(tracks.size()) + " tracks");
                         screen.Post(Event::Custom);
                     }).detach();
-                }
             }
             return true;
         }
@@ -1046,6 +1540,31 @@ int run_app() {
             return true;
         }
 
+        // Space to pause
+        if (event == Event::Character(' ') && input_str.empty()) {
+            st.player.pause();
+            return true;
+        }
+
+        // Search-as-you-type ( / )
+        if (event == Event::Character('/') && input_str.empty()) {
+            input_str = "search ";
+            return true;
+        }
+
+        // Visual select mode
+        if (event == Event::Character('v') && input_str.empty()) {
+            if (st.view == ViewMode::Tracks && !st.queue.empty()) {
+                if (st.selected_indices.count(st.selected)) {
+                    st.selected_indices.erase(st.selected);
+                } else {
+                    st.selected_indices.insert(st.selected);
+                }
+                if (st.selected < st.queue.length() - 1) st.selected++;
+                return true;
+            }
+        }
+
         // Seek forward/backward
         if (event == Event::ArrowRight && input_str.empty()) {
             st.player.seek(5.0);
@@ -1056,7 +1575,22 @@ int run_app() {
             return true;
         }
 
+        // Volume controls
+        if ((event == Event::Character('-') || event == Event::Character('=') || event == Event::Character('+')) && input_str.empty()) {
+            int step = event == Event::Character('-') ? -5 : 5;
+            int new_vol = std::max(0, std::min(150, st.player.volume() + step));
+            st.player.set_volume(new_vol);
+            st.config.volume = new_vol;
+            st.config.save();
+            return true;
+        }
+
         // Handle other keybindings that Menu doesn't catch
+        if (event == Event::Character('f') && input_str.empty()) {
+            input_str = "find ";
+            return true;
+        }
+
         if (event == Event::Character('b') && input_str.empty()) {
             if (st.view == ViewMode::Tracks && !st.playlists.empty()) {
                 st.view = ViewMode::Playlists;
@@ -1079,6 +1613,24 @@ int run_app() {
             auto t = st.queue.prev();
             if (t) play_track(st, *t);
             return true;
+        }
+
+        // Progress bar seeking
+        if (event.is_mouse() && event.mouse().button == Mouse::Left && event.mouse().motion == Mouse::Pressed) {
+            auto& box = st.progress_box;
+            if (event.mouse().x >= box.x_min && event.mouse().x <= box.x_max &&
+                event.mouse().y >= box.y_min && event.mouse().y <= box.y_max) {
+                int width = box.x_max - box.x_min;
+                if (width > 0 && st.player.duration() > 0) {
+                    // Approximate click pos to progress bar (ignoring the timestamps on sides)
+                    // The bar string is 40 chars long, but we just use the raw x percentage within the box
+                    double pct = (double)(event.mouse().x - box.x_min) / width;
+                    if (pct < 0) pct = 0;
+                    if (pct > 1) pct = 1;
+                    st.player.seek_absolute(pct * st.player.duration());
+                }
+                return true;
+            }
         }
 
         return false;
