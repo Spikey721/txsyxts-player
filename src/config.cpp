@@ -26,9 +26,10 @@ Config Config::load() {
             nlohmann::json j;
             f >> j;
             if (j.contains("sp_dc"))             cfg.sp_dc               = j["sp_dc"].get<std::string>();
+            if (j.contains("client_id"))          cfg.client_id           = j["client_id"].get<std::string>();
+            if (j.contains("client_secret"))      cfg.client_secret       = j["client_secret"].get<std::string>();
             if (j.contains("volume"))             cfg.volume              = j["volume"].get<int>();
             if (j.contains("audio_quality"))      cfg.audio_quality       = j["audio_quality"].get<std::string>();
-            if (j.contains("client_id"))          cfg.client_id           = j["client_id"].get<std::string>();
             if (j.contains("lastfm_api_key"))     cfg.lastfm_api_key      = j["lastfm_api_key"].get<std::string>();
             if (j.contains("lastfm_api_secret"))  cfg.lastfm_api_secret   = j["lastfm_api_secret"].get<std::string>();
             if (j.contains("lastfm_session_key")) cfg.lastfm_session_key  = j["lastfm_session_key"].get<std::string>();
@@ -48,6 +49,7 @@ void Config::save() const {
     j["volume"]             = volume;
     j["audio_quality"]      = audio_quality;
     if (!client_id.empty())          j["client_id"]           = client_id;
+    if (!client_secret.empty())      j["client_secret"]       = client_secret;
     if (!lastfm_api_key.empty())     j["lastfm_api_key"]      = lastfm_api_key;
     if (!lastfm_api_secret.empty())  j["lastfm_api_secret"]   = lastfm_api_secret;
     if (!lastfm_session_key.empty()) j["lastfm_session_key"]  = lastfm_session_key;

@@ -8,7 +8,8 @@ namespace txs {
 struct Config {
     // spotify
     std::string sp_dc;
-    std::string client_id = "9a8d2f0ce77a4e248bf7169b71af4a1f";
+    std::string client_id;      // Spotify API app client ID (free from developer.spotify.com)
+    std::string client_secret;  // Spotify API app client secret
 
     // player
     int volume = 70;

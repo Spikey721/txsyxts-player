@@ -10,6 +10,11 @@
 #include <unistd.h>
 #include <signal.h>
 #include <curl/curl.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <fcntl.h>
+#include <sys/select.h>
+#include <cerrno>
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
@@ -30,14 +35,64 @@ static std::string exec_cmd(const std::string& cmd) {
     return result;
 }
 
+// ── yt-dlp command builder ─────────────────────────────────────
+// Python-based tools (yt-dlp, pip) try IPv6 first and, when the
+// machine has an AAAA address but broken IPv6 connectivity, they
+// hang forever instead of falling back. Detect that once with a
+// short probe, and force yt-dlp onto IPv4 if needed. Every call
+// also gets a hard `timeout` so a hung process can never leave
+// the UI stuck on "searching...".
+
+static bool ipv6_probe_fails() {
+    struct addrinfo hints {};
+    hints.ai_family = AF_INET6;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo* res = nullptr;
+    if (getaddrinfo("www.youtube.com", "443", &hints, &res) != 0 || !res)
+        return false; // no AAAA records — default IPv4 path is fine
+
+    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd < 0) { freeaddrinfo(res); return false; } // no IPv6 stack — fine
+
+    bool broken = false;
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    if (connect(fd, res->ai_addr, res->ai_addrlen) != 0) {
+        if (errno != EINPROGRESS) {
+            broken = true;
+        } else {
+            fd_set wset;
+            FD_ZERO(&wset);
+            FD_SET(fd, &wset);
+            struct timeval tv { 2, 0 }; // 2s probe
+            if (select(fd + 1, nullptr, &wset, nullptr, &tv) <= 0) {
+                broken = true; // timed out
+            } else {
+                int err = 0; socklen_t len = sizeof(err);
+                getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len);
+                broken = (err != 0);
+            }
+        }
+    }
+    close(fd);
+    freeaddrinfo(res);
+    return broken;
+}
+
+static std::string ytdlp_cmd(const std::string& args, int timeout_s) {
+    static const bool force_v4 = ipv6_probe_fails(); // probed once
+    return std::string("timeout ") + std::to_string(timeout_s) +
+           " yt-dlp " + (force_v4 ? "--source-address 0.0.0.0 " : "") + args;
+}
+
 // ── yt-dlp search ──────────────────────────────────────────────
 
 std::vector<Track> yt_search(const std::string& query, int max_results) {
     std::vector<Track> tracks;
 
     // use yt-dlp to search and dump JSON
-    std::string cmd = "yt-dlp --dump-json --flat-playlist --no-warnings -q "
-                      "\"ytsearch" + std::to_string(max_results) + ":" + query + "\" 2>/dev/null";
+    std::string cmd = ytdlp_cmd("--dump-json --flat-playlist --no-warnings -q --age-limit 99 "
+                      "\"ytsearch" + std::to_string(max_results) + ":" + query + "\" 2>/dev/null", 60);
     std::string output = exec_cmd(cmd);
     if (output.empty()) return tracks;
 
@@ -95,8 +150,8 @@ std::vector<Track> yt_get_similar(const std::string& uri, int max_results) {
 
     // fetch Mix playlist
     std::string mix_url = "https://www.youtube.com/watch?v=" + vid + "&list=RD" + vid;
-    std::string cmd = "yt-dlp --dump-json --flat-playlist --playlist-end " + std::to_string(max_results) + 
-                      " --no-warnings -q \"" + mix_url + "\" 2>/dev/null";
+    std::string cmd = ytdlp_cmd("--dump-json --flat-playlist --playlist-end " + std::to_string(max_results) + 
+                      " --no-warnings -q --age-limit 99 \"" + mix_url + "\" 2>/dev/null", 60);
                       
     std::string output = exec_cmd(cmd);
     if (output.empty()) return tracks;
@@ -132,9 +187,9 @@ std::vector<Track> yt_get_similar(const std::string& uri, int max_results) {
 std::vector<Track> yt_fetch_playlist(const std::string& url, int max_results) {
     std::vector<Track> tracks;
     
-    std::string cmd = "yt-dlp --dump-json --flat-playlist " + 
+    std::string cmd = ytdlp_cmd("--dump-json --flat-playlist " + 
                       (max_results > 0 ? "--playlist-end " + std::to_string(max_results) : "") + 
-                      " --no-warnings -q \"" + url + "\" 2>/dev/null";
+                      " --no-warnings -q --age-limit 99 \"" + url + "\" 2>/dev/null", 90);
                       
     std::string output = exec_cmd(cmd);
     if (output.empty()) return tracks;
@@ -186,8 +241,8 @@ std::string yt_stream_url(const std::string& video_url) {
         }
 
         for (const char* fmt : fmts) {
-            std::string cmd = std::string("yt-dlp -f \"") + fmt +
-                              "\" -g --no-warnings -q \"" + video_url + "\" 2>/dev/null";
+            std::string cmd = ytdlp_cmd(std::string("-f \"") + fmt +
+                              "\" -g --no-warnings -q --age-limit 99 \"" + video_url + "\" 2>/dev/null", 30);
             std::string url = exec_cmd(cmd);
             while (!url.empty() && (url.back() == '\n' || url.back() == '\r' || url.back() == ' '))
                 url.pop_back();
@@ -292,9 +347,9 @@ std::string yt_download(const std::string& video_url, const std::string& out_dir
     // Create dir if needed
     fs::create_directories(dir);
 
-    std::string cmd = "yt-dlp -f \"ba[ext=m4a]/ba/b\" --no-warnings -q "
+    std::string cmd = ytdlp_cmd("-f \"ba[ext=m4a]/ba/b\" --no-warnings -q --age-limit 99 "
                       "--output \"" + dir + "/%(artist)s - %(title)s.%(ext)s\" "
-                      "\"" + video_url + "\" 2>/dev/null";
+                      "\"" + video_url + "\" 2>/dev/null", 900);
     // Run and return the output path (we derive it from title after download)
     int ret = system(cmd.c_str());
     return ret == 0 ? dir : "";

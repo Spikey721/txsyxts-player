@@ -30,6 +30,9 @@ public:
     // set sp_dc cookie
     void set_sp_dc(const std::string& cookie);
 
+    // set API app credentials (free from developer.spotify.com)
+    void set_credentials(const std::string& client_id, const std::string& client_secret);
+
     // set a pre-fetched access token (from browser login)
     void set_token(const std::string& token, long long expiry_ms);
 
@@ -45,12 +48,19 @@ public:
     std::vector<std::pair<std::string,std::string>> get_playlists(); // name, id
     std::vector<Track> get_playlist_tracks(const std::string& id, int limit = 100);
 
+    // Get a token by any means — authenticated (sp_dc) if configured, anonymous otherwise.
+    // Works for any public playlist with zero configuration.
+    bool ensure_token_any();
+
 private:
     std::string sp_dc_;
+    std::string client_id_;
+    std::string client_secret_;
     std::string access_token_;
     long long token_expiry_ = 0; // unix timestamp ms
 
     bool ensure_token();
+    std::string fetch_anon_token();  // anonymous guest token (no login needed)
     std::string api_get(const std::string& endpoint);
     static std::string http_get(const std::string& url,
                                 const std::string& cookie = "",

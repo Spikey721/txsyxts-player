@@ -29,6 +29,7 @@ find_package(PkgConfig REQUIRED)
 find_package(OpenSSL REQUIRED)
 pkg_check_modules(MPV REQUIRED mpv)
 pkg_check_modules(CURL REQUIRED libcurl)
+pkg_check_modules(DBUS REQUIRED dbus-1)
 
 # ── build txsyxts ───────────────────────────────────────────────
 add_executable(txsyxts
@@ -45,11 +46,13 @@ add_executable(txsyxts
   src/history.cpp
   src/scrobbler.cpp
   src/sponsorblock.cpp
+  src/mpris.cpp
 )
 
 target_include_directories(txsyxts PRIVATE
   ${MPV_INCLUDE_DIRS}
   ${CURL_INCLUDE_DIRS}
+  ${DBUS_INCLUDE_DIRS}
 )
 
 target_link_libraries(txsyxts PRIVATE
@@ -59,6 +62,7 @@ target_link_libraries(txsyxts PRIVATE
   nlohmann_json::nlohmann_json
   ${MPV_LIBRARIES}
   ${CURL_LIBRARIES}
+  ${DBUS_LIBRARIES}
   OpenSSL::Crypto
   pthread
 )

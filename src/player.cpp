@@ -24,8 +24,14 @@ Player::Player() : impl_(new Impl) {
     mpv_set_option_string(impl_->mpv, "audio-display", "no");
     mpv_set_option_string(impl_->mpv, "terminal", "no");
     mpv_set_option_string(impl_->mpv, "input-default-bindings", "no");
-    mpv_set_option_string(impl_->mpv, "ytdl", "yes");
+    // The app resolves stream URLs itself (youtube.cpp). Leave mpv's own
+    // yt-dlp integration off — otherwise mpv spawns a *second* yt-dlp for
+    // every youtube URL, which is redundant and can hang the player.
+    mpv_set_option_string(impl_->mpv, "ytdl", "no");
     mpv_set_option_string(impl_->mpv, "config", "no");
+
+    // Never hang forever on a dead/blocked network connection.
+    mpv_set_option_string(impl_->mpv, "network-timeout", "30");
 
     // Memory optimizations: Increased to 50MB forward / 10MB backward to prevent audio stuttering
     // while still maintaining a much smaller footprint than MPV's default 150MB+ cache.

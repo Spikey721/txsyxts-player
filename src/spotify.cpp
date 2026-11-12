@@ -44,7 +44,9 @@ static size_t write_cb(void* ptr, size_t size, size_t nmemb, std::string* data) 
 
 Spotify::Spotify() = default;
 
-bool Spotify::is_configured() const { return !sp_dc_.empty(); }
+bool Spotify::is_configured() const {
+    return !sp_dc_.empty() || (!client_id_.empty() && !client_secret_.empty());
+}
 
 bool Spotify::is_logged_in() const {
     if (access_token_.empty()) return false;
@@ -54,6 +56,11 @@ bool Spotify::is_logged_in() const {
 }
 
 void Spotify::set_sp_dc(const std::string& cookie) { sp_dc_ = cookie; }
+
+void Spotify::set_credentials(const std::string& client_id, const std::string& client_secret) {
+    client_id_     = client_id;
+    client_secret_ = client_secret;
+}
 
 void Spotify::set_token(const std::string& token, long long expiry_ms) {
     access_token_ = token;
@@ -213,6 +220,70 @@ bool Spotify::ensure_token() {
     }
 }
 
+// Fetch a token using the Spotify Client Credentials flow.
+// Requires client_id + client_secret from a free Spotify API app.
+// See: developer.spotify.com → Create App → copy Client ID & Secret
+// Set with: :config client_id <id>  and  :config client_secret <secret>
+std::string Spotify::fetch_anon_token() {
+    if (client_id_.empty() || client_secret_.empty()) return "";
+
+    // POST to accounts.spotify.com — NOT blocked by CDN unlike open.spotify.com
+    std::string url  = "https://accounts.spotify.com/api/token";
+    std::string body = "grant_type=client_credentials"
+                       "&client_id="     + client_id_
+                       + "&client_secret=" + client_secret_;
+
+    CURL* curl = curl_easy_init();
+    if (!curl) return "";
+
+    std::string response;
+    curl_easy_setopt(curl, CURLOPT_URL,           url.c_str());
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS,    body.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA,     &response);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT,       15L);
+
+    struct curl_slist* headers = nullptr;
+    headers = curl_slist_append(headers, "Content-Type: application/x-www-form-urlencoded");
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+    CURLcode res = curl_easy_perform(curl);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    if (res != CURLE_OK || response.empty()) return "";
+
+    try {
+        auto j = json::parse(response);
+        if (j.contains("error")) return ""; // bad credentials
+
+        std::string tok     = j.value("access_token", "");
+        int         exp_sec = j.value("expires_in", 3600);
+        if (tok.empty()) return "";
+
+        auto now = std::chrono::system_clock::now().time_since_epoch();
+        long long now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+
+        access_token_  = tok;
+        token_expiry_  = now_ms + (exp_sec * 1000LL);
+        return tok;
+    } catch (...) {
+        return "";
+    }
+}
+
+
+
+// Ensure we have *any* valid token — logged-in or anonymous.
+// Returns true if a usable token is now set.
+bool Spotify::ensure_token_any() {
+    if (is_logged_in()) return true;
+    // Try authenticated first
+    if (is_configured() && ensure_token()) return true;
+    // Fall back to anonymous guest token (works for public playlists)
+    return !fetch_anon_token().empty();
+}
+
 Spotify::LoginResult Spotify::login() {
     if (!is_configured()) {
         return {false, "run :login to open spotify in browser"};
@@ -339,7 +410,9 @@ std::vector<std::pair<std::string,std::string>> Spotify::get_playlists() {
 
 std::vector<Track> Spotify::get_playlist_tracks(const std::string& id, int limit) {
     std::vector<Track> tracks;
-    if (!ensure_token()) return tracks;
+    // Use ensure_token_any() so this works with anonymous tokens (no sp_dc needed)
+    // for public playlists, in addition to the normal sp_dc authenticated flow.
+    if (!ensure_token_any()) return tracks;
 
     int offset = 0;
     int batch = std::min(limit, 100);

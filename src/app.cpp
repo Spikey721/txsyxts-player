@@ -9,6 +9,7 @@
 #include "history.hpp"
 #include "scrobbler.hpp"
 #include "sponsorblock.hpp"
+#include "mpris.hpp"
 
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/screen_interactive.hpp>
@@ -63,6 +64,7 @@ struct AppState {
     LocalPlaylists local_playlists;
     History history;
     Scrobbler scrobbler;
+    MprisServer mpris;
 
     // UI state
     ViewMode view = ViewMode::Playlists;
@@ -131,6 +133,9 @@ struct AppState {
     // Download status line
     std::string download_status;
 
+    // Currently playing track (for MPRIS metadata)
+    Track current_track;
+
     // Layout box for progress bar clicks
     ftxui::Box progress_box;
 
@@ -184,6 +189,12 @@ static void handle_command(AppState& st, const std::string& raw,
             if (key == "sp_dc") {
                 st.config.sp_dc = val;
                 st.spotify.set_sp_dc(val);
+            } else if (key == "client_id") {
+                st.config.client_id = val;
+                st.spotify.set_credentials(st.config.client_id, st.config.client_secret);
+            } else if (key == "client_secret") {
+                st.config.client_secret = val;
+                st.spotify.set_credentials(st.config.client_id, st.config.client_secret);
             } else if (key == "volume") {
                 st.config.volume = std::stoi(val);
                 st.player.set_volume(st.config.volume);
@@ -679,7 +690,7 @@ static void handle_command(AppState& st, const std::string& raw,
     } else if (name == "update") {
         st.set_log("updating yt-dlp...");
         std::thread([&st, &screen]() {
-            int ret = system("pip install -U yt-dlp 2>/dev/null || pip3 install -U yt-dlp 2>/dev/null");
+            int ret = system("timeout 300 pip install -U yt-dlp 2>/dev/null || timeout 300 pip3 install -U yt-dlp 2>/dev/null");
             std::lock_guard<std::mutex> lk(st.mtx);
             if (ret == 0) { st.ytdlp_warn.clear(); st.set_log("yt-dlp updated: " + ytdlp_version()); }
             else st.set_log("update failed — try: pip install -U yt-dlp", true);
@@ -700,6 +711,136 @@ static void handle_command(AppState& st, const std::string& raw,
         }
         st.set_log(std::string("scrobbling: ") + (st.config.scrobble_enabled ? "on" : "off") +
                    " | configured: " + (st.scrobbler.is_configured() ? "yes" : "no"));
+
+    } else if (name == "spotifyimport") {
+        // Usage:
+        //   :spotifyimport <spotify-playlist-url>
+        //   :spotifyimport <spotify-playlist-url> <local-name>
+        if (args.empty()) {
+            st.set_log("usage: :spotifyimport <url> [local-playlist-name]", true);
+            return;
+        }
+
+        // Split URL from optional local playlist name (space-separated after URL)
+        std::string url_arg, local_name;
+        {
+            auto sp2 = args.find(' ');
+            if (sp2 != std::string::npos) {
+                url_arg    = args.substr(0, sp2);
+                local_name = args.substr(sp2 + 1);
+                while (!local_name.empty() && local_name.front() == ' ')
+                    local_name.erase(local_name.begin());
+            } else {
+                url_arg = args;
+            }
+        }
+
+        // Extract playlist ID from various Spotify URL / URI formats
+        // https://open.spotify.com/playlist/<ID>?...
+        // spotify:playlist:<ID>
+        std::string playlist_id;
+        {
+            const std::string marker1 = "/playlist/";
+            auto pos1 = url_arg.find(marker1);
+            if (pos1 != std::string::npos) {
+                std::string rest = url_arg.substr(pos1 + marker1.size());
+                for (char sep : {'?', '#', '/'}) {
+                    auto p = rest.find(sep);
+                    if (p != std::string::npos) rest = rest.substr(0, p);
+                }
+                playlist_id = rest;
+            }
+            if (playlist_id.empty()) {
+                const std::string marker2 = "spotify:playlist:";
+                auto pos2 = url_arg.find(marker2);
+                if (pos2 != std::string::npos) {
+                    playlist_id = url_arg.substr(pos2 + marker2.size());
+                    for (char sep : {'?', '#', ':'}) {
+                        auto p = playlist_id.find(sep);
+                        if (p != std::string::npos) playlist_id = playlist_id.substr(0, p);
+                    }
+                }
+            }
+        }
+
+        if (playlist_id.empty()) {
+            st.set_log("could not parse playlist ID — paste the full Spotify playlist URL", true);
+            return;
+        }
+
+        st.set_log("fetching spotify playlist...");
+        std::string pid     = playlist_id;
+        std::string pl_name = local_name;
+        std::thread([&st, &screen, pid, pl_name]() {
+            // Get a token by any means: sp_dc (best), or client credentials (free API app)
+            if (!st.spotify.ensure_token_any()) {
+                std::lock_guard<std::mutex> lk(st.mtx);
+                st.set_log("spotify not set up. run: :spotifysetup for instructions", true);
+                screen.Post(Event::Custom);
+                return;
+            }
+
+            auto tracks = st.spotify.get_playlist_tracks(pid, 500);
+
+            std::lock_guard<std::mutex> lk(st.mtx);
+            if (tracks.empty()) {
+                st.set_log("no tracks found — playlist may be private or empty", true);
+                screen.Post(Event::Custom);
+                return;
+            }
+
+            st.queue.load(tracks);
+            st.is_search_queue = false;
+            st.current_local_playlist.clear();
+            st.track_names.clear();
+            for (auto& t : tracks) st.track_names.push_back(t.display());
+            st.view = ViewMode::Tracks;
+            st.selected = 0;
+
+            std::string msg = "loaded " + std::to_string(tracks.size()) + " tracks from Spotify";
+
+            if (!pl_name.empty()) {
+                st.local_playlists.create(pl_name);
+                for (auto& t : tracks) st.local_playlists.add_track(pl_name, t);
+                st.current_local_playlist = pl_name;
+                msg += " → saved as \"" + pl_name + "\"";
+            }
+
+            st.set_log(msg);
+
+            // Auto-play the first track
+            auto first = st.queue.play_first();
+            if (first) play_track(st, *first, &screen);
+
+            screen.Post(Event::Custom);
+        }).detach();
+
+    } else if (name == "spotifysetup") {
+        bool has_creds = !st.config.client_id.empty() && !st.config.client_secret.empty();
+        bool has_spdc  = !st.config.sp_dc.empty();
+        std::string status = has_creds ? "\u2713 API credentials set" :
+                             has_spdc  ? "\u2713 sp_dc cookie set" :
+                                         "\u2717 Not configured";
+        st.info_text =
+            "\u2501\u2501 Spotify Setup (" + status + ") \u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+            "Option 1 — Free Spotify API App (recommended):\n"
+            "  1. Go to: developer.spotify.com/dashboard\n"
+            "  2. Log in → Create App\n"
+            "  3. Name: anything  |  Redirect URI: http://localhost\n"
+            "  4. Copy your Client ID and Client Secret\n"
+            "  5. Run these two commands:\n\n"
+            "       :config client_id     <your-client-id>\n"
+            "       :config client_secret <your-client-secret>\n\n"
+            "  Works for any PUBLIC playlist. Free, instant, no rate limits.\n\n"
+            "\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\n\n"
+            "Option 2 — sp_dc Cookie (for private playlists too):\n"
+            "  1. Open Chrome/Firefox, go to open.spotify.com\n"
+            "  2. Log in, then open DevTools → Application → Cookies\n"
+            "  3. Copy the value of the 'sp_dc' cookie\n"
+            "  4. Run:\n\n"
+            "       :config sp_dc <your-sp_dc-value>\n\n"
+            "  Works for public AND private playlists.\n";
+        st.view = ViewMode::Info;
     }
 }
 
@@ -773,6 +914,7 @@ static void on_track_started(AppState& st, const Track& t,
 // Capped at 3 to avoid an infinite skip loop on a dead queue.
 
 static void play_track(AppState& st, const Track& track, ftxui::ScreenInteractive* screen, int skip_count) {
+    st.current_track = track; // always store so MPRIS has correct metadata immediately
     if (track.source == "local" || track.source == "podcast") {
         st.player.play(track.uri, track.title, track.artist);
         st.set_log("\u25b6 " + track.display());
@@ -890,6 +1032,7 @@ int run_app() {
     AppState st;
     st.config = Config::load();
     st.spotify.set_sp_dc(st.config.sp_dc);
+    st.spotify.set_credentials(st.config.client_id, st.config.client_secret);
     st.player.set_volume(st.config.volume);
 
     // yt-dlp version check background
@@ -1204,24 +1347,6 @@ int run_app() {
             text("made by ~tanmaypareek  ") | color(Color::RGB(100, 100, 100)) | align_right
         }) | size(WIDTH, EQUAL, 60) | border;
 
-        Element viz;
-        if (st.player.is_playing()) {
-            double t_anim = st.player.position() * 5.0; // animation speed
-            auto c = Canvas(112, 12); // 56 cols * 2 (braille x), 3 rows * 4 (braille y)
-            for (int x = 0; x < 111; ++x) {
-                // Generate a smooth composite sine wave
-                double y1 = 6.0 + 5.0 * (std::sin(x * 0.15 + t_anim) + 0.4 * std::sin(x * 0.3 - t_anim * 1.5));
-                double y2 = 6.0 + 5.0 * (std::sin((x + 1) * 0.15 + t_anim) + 0.4 * std::sin((x + 1) * 0.3 - t_anim * 1.5));
-                c.DrawPointLine(x, (int)y1, x + 1, (int)y2, Color::RGB(152, 195, 121));
-            }
-            viz = canvas(std::move(c));
-        } else {
-            viz = vbox({
-                text(std::string(56, ' ')),
-                text(std::string(56, ' ')),
-                text(std::string(56, ' '))
-            });
-        }
 
         Element lyrics_el = filler();
         if (!st.current_lyrics.lines.empty()) {
@@ -1246,8 +1371,7 @@ int run_app() {
             (st.current_art_url.empty() ? logo : (st.current_art | border | bgcolor(Color::RGB(15,15,15)))),
             filler(),
             lyrics_el,
-            filler(),
-            viz | center
+            filler()
         }) | size(WIDTH, EQUAL, 60);
 
         auto main_content = hbox({
@@ -1337,6 +1461,40 @@ int run_app() {
         if (event == Event::Character(':') && input_str.empty()) {
             main_container->SetActiveChild(input);
             // We do NOT return true here, we let the event propagate to the input box!
+        }
+
+        // Ctrl+V — paste from system clipboard into command input
+        if (event == Event::Character('\x16')) {
+            // Try xclip, xsel, then wl-paste (Wayland)
+            auto read_clipboard = []() -> std::string {
+                const char* cmds[] = {
+                    "xclip -selection clipboard -o 2>/dev/null",
+                    "xsel --clipboard --output 2>/dev/null",
+                    "wl-paste --no-newline 2>/dev/null",
+                    nullptr
+                };
+                for (int i = 0; cmds[i]; ++i) {
+                    FILE* p = popen(cmds[i], "r");
+                    if (!p) continue;
+                    std::string result;
+                    char buf[256];
+                    while (fgets(buf, sizeof(buf), p)) result += buf;
+                    pclose(p);
+                    if (!result.empty()) {
+                        // Strip trailing newline
+                        while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
+                            result.pop_back();
+                        return result;
+                    }
+                }
+                return "";
+            };
+            std::string clip = read_clipboard();
+            if (!clip.empty()) {
+                main_container->SetActiveChild(input);
+                input_str += clip;
+            }
+            return true;
         }
 
         // Enter — submit command
@@ -1641,12 +1799,38 @@ int run_app() {
     std::thread ticker([&]() {
         while (running) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            // Update MPRIS state every tick — use current_track for title/art
+            // (player.current_title() returns the raw stream URL until MPV resolves it)
+            st.mpris.update(
+                st.current_track.title,
+                st.current_track.artist,
+                st.current_track.thumbnail_url,
+                st.player.position(),
+                st.player.duration(),
+                st.player.is_playing() || st.player.is_paused(),
+                st.player.is_paused());
             screen.Post(Event::Custom);
         }
     });
 
+    // Wire MPRIS control callbacks
+    st.mpris.on_play_pause = [&] { st.player.pause(); };
+    st.mpris.on_stop       = [&] { st.player.stop(); };
+    st.mpris.on_next       = [&] {
+        auto t = st.queue.next();
+        if (t) { play_track(st, *t, &screen); update_ascii_art(st, *t, screen); }
+    };
+    st.mpris.on_prev = [&] {
+        auto t = st.queue.prev();
+        if (t) { play_track(st, *t, &screen); update_ascii_art(st, *t, screen); }
+    };
+    st.mpris.on_seek = [&](double abs_sec) { st.player.seek_absolute(abs_sec); };
+
+    st.mpris.start();
+
     screen.Loop(component);
 
+    st.mpris.stop();
     running = false;
     ticker.join();
 

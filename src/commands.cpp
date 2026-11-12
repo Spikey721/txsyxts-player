@@ -23,6 +23,8 @@ static const std::unordered_set<std::string> COMMANDS = {
     "history", "lyrics", "download", "podcast",
     "tag", "untag", "tagged", "tags",
     "update", "sponsorblock", "scrobble",
+    // spotify import
+    "spotifyimport", "spotifysetup",
 };
 
 std::optional<Command> parse_command(const std::string& input) {
@@ -92,6 +94,11 @@ const char* HELP_TEXT =
     "  :untag <label>       remove tag from selected track\n"
     "  :tagged <label>      show all tracks with this tag\n"
     "  :tags                list all tags in use\n"
+    "\n"
+    "━━ spotify ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    "  :spotifyimport <url>           import Spotify playlist into queue\n"
+    "  :spotifyimport <url> <name>    import + save as local playlist\n"
+    "  :spotifysetup                  show Spotify setup instructions\n"
     "\n"
     "━━ features & info ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
     "  :lyrics              show lyrics for current track\n"
