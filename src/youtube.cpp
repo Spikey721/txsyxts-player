@@ -5,6 +5,7 @@
 #include <array>
 #include <filesystem>
 #include <algorithm>
+#include <fstream>
 #include <thread>
 #include <chrono>
 #include <unistd.h>
@@ -92,7 +93,8 @@ std::vector<Track> yt_search(const std::string& query, int max_results) {
 
     // use yt-dlp to search and dump JSON
     std::string cmd = ytdlp_cmd("--dump-json --flat-playlist --no-warnings -q --age-limit 99 "
-                      "\"ytsearch" + std::to_string(max_results) + ":" + query + "\" 2>/dev/null", 60);
+                      "\"ytsearch" + std::to_string(max_results) + ":" + query + "\" "
+                      "2>>/tmp/txsyxts-ytdlp.log; echo \"[search] rc=$? q=" + query + "\" >> /tmp/txsyxts-ytdlp.log", 60);
     std::string output = exec_cmd(cmd);
     if (output.empty()) return tracks;
 
@@ -222,9 +224,59 @@ std::vector<Track> yt_fetch_playlist(const std::string& url, int max_results) {
     return tracks;
 }
 
+// ── stream warm-up ─────────────────────────────────────────────
+// A freshly generated googlevideo URL answers HTTP 403 for the first
+// few seconds of its life (the edge node has not started serving that
+// object yet). yt-dlp hides this in its own download path with a 4s
+// wait before starting the transfer; mpv does not retry, so it hits
+// the 403, gives up, and the player behaves as if the track instantly
+// "ended" (which is what made tracks get skipped). Here we touch the
+// URL ourselves, retrying until the server actually answers, so the
+// URL handed to mpv is already live.
+
+static size_t warmup_discard_cb(char*, size_t size, size_t nmemb, void*) {
+    return size * nmemb;
+}
+
+static bool warm_up_stream(const std::string& url, int attempts = 12) {
+    if (url.rfind("http", 0) != 0) return true; // local file / other scheme
+
+    CURL* curl = curl_easy_init();
+    if (!curl) return true; // cannot verify — let mpv try anyway
+
+    long code = 0;
+    for (int i = 0; i < attempts; ++i) {
+        curl_easy_reset(curl);
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_RANGE, "0-1023");
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, warmup_discard_cb);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, nullptr);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 8L);
+        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(curl, CURLOPT_USERAGENT,
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36");
+
+        code = 0;
+        CURLcode res = curl_easy_perform(curl);
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+        if (res == CURLE_OK && (code == 200 || code == 206)) {
+            curl_easy_cleanup(curl);
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+
+    curl_easy_cleanup(curl);
+    return false;
+}
+
 // ── yt-dlp stream URL extraction ───────────────────────────────
-// Tries multiple format selectors and retries up to 3 times with
-// exponential backoff to handle YouTube rate-limiting and transient failures.
+// Tries multiple format selectors and retries with exponential backoff
+// to handle YouTube rate-limiting and transient failures. Every URL is
+// warmed up before being returned (see above).
 
 std::string yt_stream_url(const std::string& video_url) {
     // Format preference: m4a audio → webm audio → any audio → best
@@ -234,6 +286,8 @@ std::string yt_stream_url(const std::string& video_url) {
         "b"
     };
 
+    std::string fallback;
+
     for (int attempt = 0; attempt < 3; ++attempt) {
         if (attempt > 0) {
             // 2s on 1st retry, 4s on 2nd
@@ -242,14 +296,30 @@ std::string yt_stream_url(const std::string& video_url) {
 
         for (const char* fmt : fmts) {
             std::string cmd = ytdlp_cmd(std::string("-f \"") + fmt +
-                              "\" -g --no-warnings -q --age-limit 99 \"" + video_url + "\" 2>/dev/null", 30);
+                              "\" -g --no-warnings -q --age-limit 99 \"" + video_url + "\" "
+                              "2>>/tmp/txsyxts-ytdlp.log; echo \"[stream] rc=$? fmt=" + std::string(fmt) +
+                              " uri=" + video_url + "\" >> /tmp/txsyxts-ytdlp.log", 30);
             std::string url = exec_cmd(cmd);
             while (!url.empty() && (url.back() == '\n' || url.back() == '\r' || url.back() == ' '))
                 url.pop_back();
-            if (!url.empty()) return url;
+            if (url.empty()) continue;
+
+            // The URL only becomes fetchable a moment after generation.
+            // Wait until it actually serves data before handing it to mpv.
+            if (warm_up_stream(url)) {
+                std::ofstream("/tmp/txsyxts-ytdlp.log", std::ios::app)
+                    << "[stream] warmed ok\n";
+                return url;
+            }
+
+            // Still refusing — remember it and try again with a fresh URL.
+            if (fallback.empty()) fallback = url;
+            std::ofstream("/tmp/txsyxts-ytdlp.log", std::ios::app)
+                << "[stream] warmup failed, re-resolving\n";
+            break; // format selector worked; don't burn time on the others
         }
     }
-    return "";
+    return fallback;
 }
 
 // ── ytfzf ──────────────────────────────────────────────────────

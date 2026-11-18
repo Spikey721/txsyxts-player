@@ -1,5 +1,6 @@
 #include "player.hpp"
 #include <mpv/client.h>
+#include <chrono>
 #include <cstring>
 
 namespace txs {
@@ -8,11 +9,15 @@ struct Player::Impl {
     mpv_handle* mpv = nullptr;
     std::string title;
     std::string artist;
+    std::string url;               // last stream handed to mpv (for retries)
     double pos = 0.0;
     double dur = 0.0;
     bool paused = false;
     bool playing = false;
     bool idle = true;
+    int retry_left = 0;            // re-open attempts after a failed load
+    bool pending_retry = false;
+    std::chrono::steady_clock::time_point retry_at;
 };
 
 Player::Player() : impl_(new Impl) {
@@ -61,10 +66,13 @@ void Player::play(const std::string& url, const std::string& title,
 
     impl_->title = title;
     impl_->artist = artist;
+    impl_->url = url;
     impl_->pos = 0.0;
     impl_->dur = 0.0;
     impl_->playing = true;
     impl_->idle = false;
+    impl_->retry_left = 2;
+    impl_->pending_retry = false;
 
     const char* cmd[] = {"loadfile", url.c_str(), nullptr};
     mpv_command(impl_->mpv, cmd);
@@ -82,9 +90,12 @@ void Player::stop() {
     mpv_command(impl_->mpv, cmd);
     impl_->title.clear();
     impl_->artist.clear();
+    impl_->url.clear();
     impl_->pos = 0.0;
     impl_->dur = 0.0;
     impl_->playing = false;
+    impl_->retry_left = 0;
+    impl_->pending_retry = false;
 }
 
 void Player::seek(double seconds) {
@@ -133,6 +144,16 @@ void Player::set_loudnorm(bool enable) {
 void Player::poll_events() {
     if (!impl_->mpv) return;
 
+    // A load that failed (e.g. HTTP 403 on a cold googlevideo URL) makes
+    // mpv go idle, which used to be reported as "track ended" and made
+    // the app skip the song. Retry the same stream a couple of times
+    // before ever telling the app the track finished.
+    if (impl_->pending_retry && std::chrono::steady_clock::now() >= impl_->retry_at) {
+        impl_->pending_retry = false;
+        const char* cmd[] = {"loadfile", impl_->url.c_str(), nullptr};
+        mpv_command(impl_->mpv, cmd);
+    }
+
     while (true) {
         mpv_event* ev = mpv_wait_event(impl_->mpv, 0);
         if (ev->event_id == MPV_EVENT_NONE) break;
@@ -149,6 +170,17 @@ void Player::poll_events() {
             } else if (strcmp(prop->name, "idle-active") == 0 && prop->format == MPV_FORMAT_FLAG) {
                 bool idle = *static_cast<int*>(prop->data) != 0;
                 if (idle && impl_->playing) {
+                    // Nothing ever played (no duration, position still 0):
+                    // the stream failed to open rather than finishing.
+                    if (impl_->dur <= 0.0 && impl_->pos <= 0.5 &&
+                        impl_->retry_left > 0 && !impl_->url.empty()) {
+                        --impl_->retry_left;
+                        impl_->pending_retry = true;
+                        impl_->retry_at = std::chrono::steady_clock::now() +
+                                          std::chrono::seconds(3);
+                        impl_->idle = idle;
+                        continue;
+                    }
                     impl_->playing = false;
                     impl_->title.clear();
                     impl_->artist.clear();
