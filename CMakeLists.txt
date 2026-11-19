@@ -49,6 +49,10 @@ add_executable(txsyxts
   src/mpris.cpp
 )
 
+target_compile_definitions(txsyxts PRIVATE
+  TXSYXTS_BUILD_TAG="warmup-1"
+)
+
 target_include_directories(txsyxts PRIVATE
   ${MPV_INCLUDE_DIRS}
   ${CURL_INCLUDE_DIRS}
