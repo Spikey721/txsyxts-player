@@ -30,7 +30,15 @@ std::string Track::search_query() const {
 
 std::string Track::display() const {
     if (artist.empty()) return title;
-    return artist + " — " + title;
+    // YouTube titles frequently repeat the uploader ("Artist - Song"), which
+    // would print twice once the artist is already part of the line.
+    std::string t = title;
+    for (const char* sep : {" - ", " \u2013 ", " \u2014 ", ": "}) {
+        std::string p = artist + sep;
+        if (t.rfind(p, 0) == 0) { t = t.substr(p.size()); break; }
+    }
+    if (t.empty()) return artist;
+    return artist + " \u2014 " + t;
 }
 
 // ── curl callback ──────────────────────────────────────────────

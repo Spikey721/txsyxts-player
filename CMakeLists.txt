@@ -50,7 +50,7 @@ add_executable(txsyxts
 )
 
 target_compile_definitions(txsyxts PRIVATE
-  TXSYXTS_BUILD_TAG="warmup-2-lyrics"
+  TXSYXTS_BUILD_TAG="warmup-3-ui"
 )
 
 target_include_directories(txsyxts PRIVATE

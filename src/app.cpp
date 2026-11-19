@@ -50,6 +50,50 @@ static std::string fmt_time(double secs) {
     return buf;
 }
 
+// ── utf-8 width helpers ────────────────────────────────────────
+// Titles and artists are UTF-8 with emoji/accents, so byte slicing would cut
+// glyphs in half. FTXUI already knows grapheme widths — use that.
+
+static int text_width(const std::string& s) {
+    return string_width(s);
+}
+
+// Truncate to at most max_w terminal columns, adding an ellipsis when cut.
+static std::string ellipsize(const std::string& s, int max_w) {
+    if (max_w <= 0) return "";
+    if (text_width(s) <= max_w) return s;
+
+    std::string out;
+    int w = 0;
+    for (const auto& g : Utf8ToGlyphs(s)) {
+        int gw = string_width(g);
+        if (gw <= 0) { out += g; continue; }   // combining marks / zero-width
+        if (w + gw > max_w - 1) break;         // keep room for the ellipsis
+        out += g;
+        w += gw;
+    }
+    return out + "\u2026";
+}
+
+// YouTube titles often repeat the artist ("Rick Astley - Never Gonna…"),
+// which looks bad once we already print the artist. Strip the prefix.
+static std::string strip_artist_prefix(const std::string& title_in, const std::string& artist) {
+    std::string title = title_in;
+    if (artist.empty()) return title;
+    for (const char* sep : {" - ", " \u2013 ", " \u2014 ", ": "}) {
+        std::string p = artist + sep;
+        if (title.rfind(p, 0) == 0) return title.substr(p.size());
+    }
+    return title;
+}
+
+static std::string track_line(const std::string& artist, const std::string& title_in) {
+    std::string title = strip_artist_prefix(title_in, artist);
+    if (artist.empty()) return title;
+    if (title.empty()) return artist;
+    return artist + " \u2014 " + title;
+}
+
 // ── view modes ─────────────────────────────────────────────────
 
 enum class ViewMode { Home, Playlists, Tracks, Info, Lyrics };
@@ -89,9 +133,10 @@ struct AppState {
     bool auto_lyrics = false;
     std::string last_artist;
     std::string last_title;
-    std::string loop_btn_text = " \U0001f501 Loop: Off ";
-    std::string autoplay_btn_text = " \u221e Autoplay: On ";
-    std::string autolyrics_btn_text = " ♫ Lyrics: Off ";
+    std::string play_btn_text = " \u25b6  ";
+    std::string loop_btn_text = "  \u27f2 loop  ";
+    std::string autoplay_btn_text = "  \u221e autoplay  ";
+    std::string autolyrics_btn_text = "  \u266b lyrics  ";
 
     // UI elements
     std::vector<std::string> pl_names;
@@ -1047,6 +1092,8 @@ static Element render_lyrics_body(AppState& st, const Lyrics& lyr) {
     std::string artist = st.current_track.artist;
     if (title.empty()) title = st.player.current_title();
     if (title.find("http") == 0 || title.find("googlevideo") != std::string::npos) title.clear();
+    title = strip_artist_prefix(title, artist);
+    title = ellipsize(title, std::max(20, ftxui::Terminal::Size().dimx - 8));
 
     Elements content;
 
@@ -1217,37 +1264,69 @@ int run_app() {
     std::string input_str;
     auto input = Input(&input_str, ":");
 
-    auto btn_prev = Button(" \u23ee  ", [&]{ auto t = st.queue.prev(); if(t){ play_track(st, *t, &screen); update_ascii_art(st, *t, screen); } }, ButtonOption::Animated(Color::GrayDark, Color::GrayLight, Color::White, Color::White));
-    auto btn_play = Button(" \u23ef  ", [&]{ st.player.pause(); }, ButtonOption::Animated(Color::RGB(152, 195, 121), Color::RGB(152, 195, 121), Color::White, Color::White));
-    auto btn_next = Button(" \u23ed  ", [&]{ auto t = st.queue.next(); if(t){ play_track(st, *t, &screen); update_ascii_art(st, *t, screen); } }, ButtonOption::Animated(Color::GrayDark, Color::GrayLight, Color::White, Color::White));
+    // ── controls ───────────────────────────────────────────────
+    // Minimal: no boxes or emoji, colour alone carries the state
+    // (accent = on / primary, dim = off).
+    auto transport_opt = [](bool accent) {
+        ButtonOption o;
+        o.transform = [accent](const EntryState& s) {
+            Color c = s.focused ? Color::RGB(245, 245, 245)
+                                : (accent ? Color::RGB(152, 195, 121)
+                                          : Color::RGB(135, 135, 135));
+            Element el = text(s.label) | color(c);
+            if (s.focused || accent) el = el | bold;
+            return el;
+        };
+        return o;
+    };
+
+    auto toggle_opt = [](std::function<bool()> on) {
+        ButtonOption o;
+        o.transform = [on](const EntryState& s) {
+            bool active = on();
+            Color c = s.focused ? Color::RGB(245, 245, 245)
+                                : (active ? Color::RGB(152, 195, 121)
+                                          : Color::RGB(92, 92, 92));
+            Element el = text(s.label) | color(c);
+            if (active || s.focused) el = el | bold;
+            return el;
+        };
+        return o;
+    };
+
+    auto btn_prev = Button(" \u23ee  ", [&]{ auto t = st.queue.prev(); if(t){ play_track(st, *t, &screen); update_ascii_art(st, *t, screen); } }, transport_opt(false));
+    auto btn_play = Button(&st.play_btn_text, [&]{ st.player.pause(); }, transport_opt(true));
+    auto btn_next = Button(" \u23ed  ", [&]{ auto t = st.queue.next(); if(t){ play_track(st, *t, &screen); update_ascii_art(st, *t, screen); } }, transport_opt(false));
 
     auto btn_loop = Button(&st.loop_btn_text, [&]{
         st.queue.cycle_loop();
         st.set_log("loop: " + st.queue.loop_str());
-        st.loop_btn_text = " \U0001f501 Loop: " + st.queue.loop_str() + " ";
-    }, ButtonOption::Animated(Color::GrayDark, Color::GrayLight, Color::White, Color::White));
+    }, toggle_opt([&]{ return st.queue.loop() != LoopMode::Off; }));
 
     auto btn_autoplay = Button(&st.autoplay_btn_text, [&]{
         st.autoplay = !st.autoplay;
         st.set_log(std::string("autoplay: ") + (st.autoplay ? "on" : "off"));
-        st.autoplay_btn_text = " \u221e Autoplay: " + std::string(st.autoplay ? "On " : "Off ");
-    }, ButtonOption::Animated(Color::GrayDark, Color::GrayLight, Color::White, Color::White));
+    }, toggle_opt([&]{ return st.autoplay; }));
 
     auto btn_autolyrics = Button(&st.autolyrics_btn_text, [&]{
         st.auto_lyrics = !st.auto_lyrics;
         st.set_log(std::string("auto lyrics: ") + (st.auto_lyrics ? "on" : "off"));
-        st.autolyrics_btn_text = " ♫ Lyrics: " + std::string(st.auto_lyrics ? "On " : "Off ");
         if (st.auto_lyrics && st.current_lyrics.lines.empty() && st.info_text.empty() && !st.player.current_title().empty()) {
             handle_command(st, "lyrics", screen);
         }
-    }, ButtonOption::Animated(Color::GrayDark, Color::GrayLight, Color::White, Color::White));
+    }, toggle_opt([&]{ return st.auto_lyrics; }));
 
-    auto controls = Container::Horizontal({ btn_prev, btn_play, btn_next, btn_loop, btn_autoplay, btn_autolyrics });
+    auto controls = Container::Horizontal({ btn_prev, btn_play, btn_next });
+    auto toggles  = Container::Horizontal({ btn_loop, btn_autoplay, btn_autolyrics });
 
     MenuOption track_opt;
     track_opt.on_enter = [] {};
     track_opt.entries_option.transform = [&](const EntryState& state) {
         bool focused = state.focused;
+        // Row width budget: terminal − left panel (60) − right border (2)
+        // − scrollbar (1) − padding (2).
+        const int row_w = std::max(24, ftxui::Terminal::Size().dimx - 65);
+
         if (st.view == ViewMode::Playlists) {
             auto& pl = st.playlists[state.index];
             bool active = (state.index == st.pl_selected);
@@ -1255,7 +1334,7 @@ int run_app() {
             std::string prefix = active ? "\u25b6" : " ";
             auto row = hbox({
                 text(prefix + " " + std::string(idx) + "  ") | color(Color::GrayDark),
-                text(pl.first) | (active ? bold : nothing) | color(active ? Color::RGB(152, 195, 121) : Color::GrayLight)
+                text(ellipsize(pl.first, row_w - 7)) | (active ? bold : nothing) | color(active ? Color::RGB(152, 195, 121) : Color::GrayLight)
             });
             if (focused) row = row | inverted;
             else if (active) row = row | bgcolor(Color::RGB(26, 26, 26));
@@ -1268,14 +1347,31 @@ int run_app() {
             if (st.selected_indices.count(state.index)) marker = "[✓]";
             char idx[16]; snprintf(idx, sizeof(idx), "%3d", state.index + 1);
             std::string dur = t.duration_str();
-            std::string artist_s = t.artist.empty() ? "" : "  " + t.artist;
+
+            // Fixed parts: prefix (7) + duration + gap + add hint (3).
+            int fixed = 7 + text_width(dur) + 1 + 3;
+            int text_avail = std::max(10, row_w - fixed);
+
+            std::string title = strip_artist_prefix(t.title, t.artist);
+            std::string artist = t.artist;
+            if (!artist.empty()) {
+                int title_budget = std::max(8, (int)((text_avail - 2) * 0.62));
+                int artist_budget = std::max(6, text_avail - 2 - title_budget);
+                title = ellipsize(title, title_budget);
+                artist = "  " + ellipsize(artist, artist_budget);
+            } else {
+                title = ellipsize(title, text_avail);
+            }
+
             auto row = hbox({
                 text(marker + " " + std::string(idx) + "  ") | color(Color::GrayDark),
-                text(t.title) | (playing ? bold : nothing) | color(playing ? Color::RGB(152, 195, 121) : Color::GrayLight),
-                text(artist_s) | color(Color::GrayDark),
+                text(title) | (playing ? bold : nothing) | color(playing ? Color::RGB(152, 195, 121) : Color::GrayLight),
+                text(artist) | color(Color::GrayDark),
                 filler(),
                 text(dur + " ") | color(Color::GrayDark),
-                text(" [+] Add ") | (focused ? color(Color::Black) : color(Color::GrayDark))
+                // a single '+' on the selected row: discoverable, still calm
+                text((focused || active) ? " + " : "   ")
+                    | color(focused ? Color::Black : Color::RGB(110, 110, 110))
             });
             if (focused) row = row | inverted;
             else if (active) row = row | bgcolor(Color::RGB(26, 26, 26));
@@ -1287,6 +1383,7 @@ int run_app() {
 
     auto main_container = Container::Vertical({
         controls,
+        toggles,
         menu_pl,
         menu_tr,
         input
@@ -1384,9 +1481,13 @@ int run_app() {
         std::string state_icon = st.player.is_paused() ? "⏸" :
                                  (!np_title.empty() ? "▶" : " ");
 
-        std::string sh_str = st.queue.shuffle() ? "⤮ on" : "";
-        std::string lo_str = st.queue.loop() != LoopMode::Off ?
-                             ("↻ " + st.queue.loop_str()) : "";
+        std::string sh_str = st.queue.shuffle() ? "\u21c4 shuffle" : "";
+
+        // control labels follow playback / queue state
+        st.play_btn_text = st.player.is_playing() ? " \u23f8  " : " \u25b6  ";
+        std::string loop_mode = st.queue.loop_str();
+        st.loop_btn_text = "  \u27f2 loop" +
+                           (loop_mode == "off" ? "" : " \u00b7 " + loop_mode) + "  ";
         
         int vol_val = st.player.volume();
         int v_bars = vol_val / 10;
@@ -1395,22 +1496,32 @@ int run_app() {
         std::string v_empty; for(int i=0; i<15-v_bars; i++) v_empty += "░";
         std::string vol_str = "vol: " + v_filled + v_empty + " " + std::to_string(vol_val);
 
+        // Fit the now-playing line to whatever the transport + toggles leave.
+        int np_budget = ftxui::Terminal::Size().dimx
+                        - text_width(" \u23ee  ") - text_width(st.play_btn_text)
+                        - text_width(" \u23ed  ")
+                        - text_width(st.loop_btn_text)
+                        - text_width(st.autoplay_btn_text)
+                        - text_width(st.autolyrics_btn_text) - 14;
+        np_budget = std::max(8, std::min(np_budget, 46));
+        std::string np_line = ellipsize(track_line(np_artist, np_title), np_budget);
+
         auto now_playing = vbox({
             hbox({
                 controls->Render(),
-                text("  "),
-                text((np_artist + " - " + np_title).length() > 40 ? 
-                     (np_artist + " - " + np_title).substr(0, 37) + "..." : 
-                     np_artist + " - " + np_title) | bold | color(Color::White),
+                text("   "),
+                text(np_line) | bold | color(Color::RGB(235, 235, 235)),
                 filler(),
+                toggles->Render(),
             }),
             hbox({
-                text(fmt_time(pos) + " ") | color(Color::GrayDark),
+                text(fmt_time(pos)) | color(Color::GrayDark),
+                text(" "),
                 text(bar_filled) | color(Color::RGB(152, 195, 121)),
-                text(bar_empty) | color(Color::RGB(51, 51, 51)),
+                text(bar_empty) | color(Color::RGB(46, 46, 46)),
                 text(" " + fmt_time(dur)) | color(Color::GrayDark),
                 filler(),
-                text(sh_str + "  " + lo_str + "  " + vol_str) | color(Color::GrayDark),
+                text((sh_str.empty() ? "" : sh_str + "   ") + vol_str) | color(Color::GrayDark),
             }) | reflect(st.progress_box),
         });
 
