@@ -28,6 +28,8 @@ public:
     bool is_playing() const;
     bool is_paused() const;
     double position() const;
+    // position extrapolated to "now" (smoother than the last mpv event)
+    double predicted_position() const;
     double duration() const;
     const std::string& current_title() const;
     const std::string& current_artist() const;

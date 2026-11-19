@@ -8,6 +8,10 @@
 #include <fstream>
 #include <thread>
 #include <chrono>
+#include <cstring>
+#include <cstdint>
+#include <cmath>
+#include <cctype>
 #include <unistd.h>
 #include <signal.h>
 #include <curl/curl.h>
@@ -426,7 +430,12 @@ std::string yt_download(const std::string& video_url, const std::string& out_dir
 }
 
 // ── Lyrics ────────────────────────────────────────────────────────────────────
-// Uses lrclib.net — completely free, no auth, returns plain text lyrics
+// Provider chain, same idea as the DMS shell: lrclib → KuGou → lyricsplus.
+// lrclib is the best source (clean LRC timings, no auth). KuGou covers a lot
+// of material lrclib misses and also returns LRC. lyricsplus aggregates Apple
+// Music / QQ / Deezer. We keep going until timed lines are found; a plain-only
+// result is kept as a fallback so the lyrics pane is never blank when
+// something was actually found.
 
 static size_t lyrics_write_cb(void* c, size_t s, size_t n, void* u) {
     static_cast<std::string*>(u)->append(static_cast<char*>(c), s * n);
@@ -447,82 +456,432 @@ static std::string url_encode_simple(const std::string& s) {
     return out;
 }
 
-Lyrics fetch_lyrics(const std::string& artist, const std::string& title) {
-    Lyrics result;
-    if (artist.empty() && title.empty()) {
-        result.plain = "No track info available.";
-        return result;
-    }
+static std::string lyr_trim(const std::string& in) {
+    size_t a = 0, b = in.size();
+    while (a < b && isspace((unsigned char)in[a])) ++a;
+    while (b > a && isspace((unsigned char)in[b - 1])) --b;
+    return in.substr(a, b - a);
+}
 
-    std::string q = artist + " " + title;
-    std::string url = "https://lrclib.net/api/search?q=" + url_encode_simple(q);
+// Small HTTP GET helper shared by all providers. Returns "" on any error so
+// callers can just move on to the next provider.
+static std::string http_get(const std::string& url, long timeout = 15) {
+    CURL* curl = curl_easy_init();
+    if (!curl) return "";
 
     std::string response;
-    CURL* curl = curl_easy_init();
-    if (!curl) {
-        result.plain = "Failed to init curl.";
-        return result;
-    }
-
     char errbuf[CURL_ERROR_SIZE];
     errbuf[0] = 0;
 
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, lyrics_write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "txsyxts/0.1");
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L); // Bypass CA cert issues
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "Mozilla/5.0 (X11; Linux x86_64) txsyxts/0.1");
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
     curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
-    
+
     CURLcode res = curl_easy_perform(curl);
+    long code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
     curl_easy_cleanup(curl);
 
-    if (res != CURLE_OK) {
-        result.plain = "Network error: " + std::string(errbuf[0] ? errbuf : curl_easy_strerror(res));
-        return result;
-    }
-    
-    if (response.empty()) {
-        result.plain = "Empty response from lyrics server.";
-        return result;
-    }
+    if (res != CURLE_OK || code >= 400) return "";
+    return response;
+}
 
-    try {
-        auto j = nlohmann::json::parse(response);
-        if (j.is_array() && !j.empty()) {
-            auto first = j[0];
-            if (first.contains("plainLyrics") && !first["plainLyrics"].is_null()) {
-                result.plain = first["plainLyrics"].get<std::string>();
-            }
-            if (first.contains("syncedLyrics") && !first["syncedLyrics"].is_null()) {
-                std::string raw = first["syncedLyrics"].get<std::string>();
-            std::istringstream ss(raw);
-            std::string line;
-            while (std::getline(ss, line)) {
-                auto rb = line.find(']');
-                if (line.size() > 1 && line[0] == '[' && rb != std::string::npos) {
-                    std::string ts = line.substr(1, rb - 1);
-                    std::string text = line.substr(rb + 1);
-                    if (!text.empty() && text[0] == ' ') text = text.substr(1);
-                    
-                    auto colon = ts.find(':');
-                    if (colon != std::string::npos) {
-                        try {
-                            double m = std::stod(ts.substr(0, colon));
-                            double s = std::stod(ts.substr(colon + 1));
-                            result.lines.push_back({m * 60.0 + s, text});
-                        } catch (...) {}
-                    }
+// KuGou ships lyric files base64-encoded.
+static std::string b64_decode(const std::string& in) {
+    static const char* tbl_src =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    int8_t tbl[256];
+    memset(tbl, -1, sizeof(tbl));
+    for (int i = 0; i < 64; ++i) tbl[(unsigned char)tbl_src[i]] = (int8_t)i;
+
+    std::string out;
+    out.reserve(in.size() * 3 / 4);
+    int val = 0, bits = 0;
+    for (unsigned char c : in) {
+        if (c == '=') break;
+        int8_t d = tbl[c];
+        if (d < 0) continue;
+        val = (val << 6) | d;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out += (char)((val >> bits) & 0xFF);
+        }
+    }
+    return out;
+}
+
+// ── metadata cleaning ─────────────────────────────────────────────────────────
+// YouTube titles carry a lot of noise ("(Official Video)", "[HD]", "| Lyrics").
+// Every provider matches markedly better once that is stripped.
+
+static bool lyr_ends_with(const std::string& s, const std::string& suf) {
+    return s.size() >= suf.size() && s.compare(s.size() - suf.size(), suf.size(), suf) == 0;
+}
+
+static bool lyric_junk_segment(const std::string& seg) {
+    static const char* junk[] = {
+        "official", "video", "audio", "lyric", "visualizer", "remaster",
+        "hd", "hq", "4k", "8k", "m/v", "music video", "topic", "from the",
+        "soundtrack", "original", "explicit", "clean", "live", "edit",
+        "version", "full song", "color coded", "prod."
+    };
+    std::string l = seg;
+    for (auto& c : l) c = (char)tolower((unsigned char)c);
+    for (auto* j : junk)
+        if (l.find(j) != std::string::npos) return true;
+    return false;
+}
+
+static std::string strip_groups(const std::string& s, bool only_junk) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size();) {
+        char c = s[i];
+        if (c == '(' || c == '[' || c == '{') {
+            char close = c == '(' ? ')' : (c == '[' ? ']' : '}');
+            size_t rb = s.find(close, i + 1);
+            if (rb != std::string::npos) {
+                std::string seg = s.substr(i + 1, rb - i - 1);
+                if (!only_junk || lyric_junk_segment(seg)) {
+                    i = rb + 1;
+                    out += ' ';
+                    continue;
                 }
             }
-            }
         }
-    } catch (...) {}
-
-    if (result.empty()) {
-        result.plain = "Lyrics not found for: " + artist + " - " + title;
+        out += c;
+        ++i;
     }
+    return out;
+}
+
+static void clean_meta(std::string& artist, std::string& title) {
+    std::string t = lyr_trim(strip_groups(title, true));
+    if (t.empty()) t = lyr_trim(strip_groups(title, false));
+
+    // "Song | Some Channel" — the part after the pipe is rarely the song name
+    auto bar = t.find(" | ");
+    if (bar != std::string::npos) t = lyr_trim(t.substr(0, bar));
+    t = lyr_trim(t);
+    if (!t.empty()) title = t;
+
+    std::string a = artist;
+    for (const char* suf : {" - Topic", "VEVO", " - Official", " Official"})
+        if (lyr_ends_with(a, suf)) a = lyr_trim(a.substr(0, a.size() - strlen(suf)));
+    for (const char* ft : {" feat. ", " ft. ", " Feat. ", " featuring "}) {
+        auto p = a.find(ft);
+        if (p != std::string::npos) a = lyr_trim(a.substr(0, p));
+    }
+    artist = a;
+}
+
+// ── LRC parsing ──────────────────────────────────────────────────────────────
+// Handles [mm:ss.xx], [mm:ss:xx], several timestamps per line and [offset:..].
+
+static void parse_lrc(const std::string& raw, std::vector<LyricLine>& out) {
+    int offset_ms = 0;
+    std::istringstream ss(raw);
+    std::string line;
+    while (std::getline(ss, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+
+        size_t i = 0;
+        bool any_tag = false;
+        std::vector<double> times;
+
+        while (i < line.size() && line[i] == '[') {
+            auto rb = line.find(']', i + 1);
+            if (rb == std::string::npos) break;
+            std::string tag = line.substr(i + 1, rb - i - 1);
+
+            if (tag.rfind("offset:", 0) == 0) {
+                offset_ms = atoi(tag.c_str() + 7);
+                i = rb + 1;
+                any_tag = true;
+                continue;
+            }
+
+            auto c1 = tag.find(':');
+            if (c1 == std::string::npos || c1 == 0 || !isdigit((unsigned char)tag[0])) break;
+
+            bool numeric = true;
+            for (size_t k = 0; k < c1; ++k)
+                if (!isdigit((unsigned char)tag[k])) { numeric = false; break; }
+            if (!numeric) break;
+
+            std::string rest = tag.substr(c1 + 1);
+            if (rest.empty()) break;
+
+            double sec;
+            auto c2 = rest.find(':');
+            if (c2 != std::string::npos) // [mm:ss:centiseconds]
+                sec = atof(rest.substr(0, c2).c_str()) +
+                      atof(rest.substr(c2 + 1).c_str()) / 100.0;
+            else
+                sec = atof(rest.c_str());
+
+            times.push_back(atoi(tag.substr(0, c1).c_str()) * 60.0 + sec);
+            i = rb + 1;
+            any_tag = true;
+        }
+
+        if (!any_tag || times.empty()) continue;
+
+        std::string text = lyr_trim(line.substr(i));
+        if (text.empty()) continue;
+
+        for (double t : times)
+            out.push_back({t + offset_ms / 1000.0, text});
+    }
+
+    std::sort(out.begin(), out.end(),
+              [](const LyricLine& a, const LyricLine& b) { return a.time_sec < b.time_sec; });
+}
+
+// ── provider 1: lrclib ────────────────────────────────────────────────────────
+
+static void lrclib_fill(const json& o, Lyrics& out) {
+    out.source = "lrclib";
+    out.instrumental = o.value("instrumental", false);
+
+    if (o.contains("syncedLyrics") && !o["syncedLyrics"].is_null())
+        parse_lrc(o["syncedLyrics"].get<std::string>(), out.lines);
+
+    if (o.contains("plainLyrics") && !o["plainLyrics"].is_null()) {
+        std::string plain = o["plainLyrics"].get<std::string>();
+        // some entries ship LRC inside plainLyrics
+        if (out.lines.empty() && plain.find("[0") != std::string::npos)
+            parse_lrc(plain, out.lines);
+        if (out.lines.empty()) out.plain = plain;
+    }
+
+    if (out.instrumental && out.empty()) out.plain = "\u266a instrumental";
+}
+
+static bool lrclib_exact(const std::string& artist, const std::string& title,
+                         int dur, Lyrics& out) {
+    std::string u = "https://lrclib.net/api/get?artist_name=" + url_encode_simple(artist) +
+                    "&track_name=" + url_encode_simple(title);
+    if (dur > 0) u += "&duration=" + std::to_string(dur);
+
+    auto body = http_get(u, 12);
+    if (body.empty()) return false;
+
+    json j;
+    try { j = json::parse(body); } catch (...) { return false; }
+    if (!j.is_object()) return false;
+
+    lrclib_fill(j, out);
+    return !out.empty();
+}
+
+static bool lrclib_search(const std::string& q, int dur, Lyrics& out) {
+    auto body = http_get("https://lrclib.net/api/search?q=" + url_encode_simple(q), 12);
+    if (body.empty()) return false;
+
+    json j;
+    try { j = json::parse(body); } catch (...) { return false; }
+    if (!j.is_array() || j.empty()) return false;
+
+    int best = -1, best_score = -1000;
+    for (int i = 0; i < (int)j.size() && i < 12; ++i) {
+        const auto& o = j[i];
+        int score = 0;
+
+        bool synced = o.contains("syncedLyrics") && !o["syncedLyrics"].is_null() &&
+                      o["syncedLyrics"].get<std::string>().size() > 20;
+        if (synced) score += 4;
+        if (o.value("instrumental", false)) score += 1;
+
+        double d = o.value("duration", 0.0);
+        if (dur > 0 && d > 1.0) {
+            double diff = std::abs(d - (double)dur);
+            if (diff <= 2.0) score += 5;
+            else if (diff <= 5.0) score += 3;
+            else if (diff > 15.0) score -= 5;
+        }
+
+        if (score > best_score) { best_score = score; best = i; }
+    }
+
+    if (best < 0) return false;
+    lrclib_fill(j[best], out);
+    return !out.empty();
+}
+
+// ── provider 2: KuGou ────────────────────────────────────────────────────────
+// Search the song, look up its lyric document by hash+duration, then download
+// the LRC. KuGou's catalogue is huge, which is why the DMS shell uses it.
+
+static bool lyrics_from_kugou(const std::string& artist, const std::string& title,
+                              int dur, Lyrics& out) {
+    std::string q = artist.empty() ? title : artist + " " + title;
+    auto body = http_get("https://mobileservice.kugou.com/api/v3/search/song"
+                         "?format=json&page=1&pagesize=6&showtype=1&keyword=" +
+                         url_encode_simple(q), 12);
+    if (body.empty()) return false;
+
+    json j;
+    try { j = json::parse(body); } catch (...) { return false; }
+    if (!j.contains("data") || !j["data"].contains("info") ||
+        !j["data"]["info"].is_array()) return false;
+
+    int tried = 0;
+    for (const auto& s : j["data"]["info"]) {
+        if (tried++ >= 4) break;
+
+        std::string hash = s.value("hash", "");
+        std::string name = s.value("songname", title);
+        int sdur = s.value("duration", 0);
+        if (hash.empty()) continue;
+        // skip wildly different versions (live/karaoke/remix)
+        if (dur > 0 && sdur > 0 && std::abs(sdur / 1000 - dur) > 20) continue;
+
+        auto sb = http_get("https://lyrics.kugou.com/search?ver=1&man=yes&client=pc"
+                           "&keyword=" + url_encode_simple(name) +
+                           "&duration=" + std::to_string(sdur) + "&hash=" + hash, 12);
+        if (sb.empty()) continue;
+
+        json sj;
+        try { sj = json::parse(sb); } catch (...) { continue; }
+        if (!sj.contains("candidates") || !sj["candidates"].is_array() ||
+            sj["candidates"].empty()) continue;
+
+        const auto& c = sj["candidates"][0];
+        std::string id = c.value("id", ""), key = c.value("accesskey", "");
+        if (id.empty() || key.empty()) continue;
+
+        auto db = http_get("https://lyrics.kugou.com/download?ver=1&client=pc&fmt=lrc"
+                           "&charset=utf8&id=" + id + "&accesskey=" + key, 12);
+        if (db.empty()) continue;
+
+        json dj;
+        try { dj = json::parse(db); } catch (...) { continue; }
+        if (!dj.contains("content") || !dj["content"].is_string()) continue;
+
+        std::vector<LyricLine> lines;
+        parse_lrc(b64_decode(dj["content"].get<std::string>()), lines);
+        if (lines.empty()) continue;
+
+        // KuGou LRC files usually open with a "Title - Artist" credit line
+        auto is_credit = [&](const LyricLine& l) {
+            if (l.time_sec > 5.0) return false;
+            std::string t = l.text, tt = title;
+            for (auto& ch : t) ch = (char)tolower((unsigned char)ch);
+            for (auto& ch : tt) ch = (char)tolower((unsigned char)ch);
+            return !tt.empty() && t.find(tt) != std::string::npos && t.find(" - ") != std::string::npos;
+        };
+        lines.erase(std::remove_if(lines.begin(), lines.end(), is_credit), lines.end());
+        if (lines.empty()) continue;
+
+        // KuGou marks instrumentals with a single placeholder line
+        // ("纯音乐，请欣赏" / "instrumental"). Treat that as a real result
+        // instead of showing one useless line.
+        if (lines.size() <= 1) {
+            std::string only = lines.empty() ? "" : lines[0].text;
+            std::string lower = only;
+            for (auto& ch : lower) ch = (char)tolower((unsigned char)ch);
+            if (lower.find("instrumental") != std::string::npos ||
+                only.find("\xe7\xba\xaf\xe9\x9f\xb3\xe4\xb9\x90") != std::string::npos) {
+                out.lines.clear();
+                out.instrumental = true;
+                out.plain = "\u266a instrumental";
+                out.source = "kugou";
+                return true;
+            }
+            continue;
+        }
+
+        out.lines = std::move(lines);
+        out.source = "kugou";
+        return true;
+    }
+    return false;
+}
+
+// ── provider 3: lyricsplus (Apple Music / QQ / Deezer) ───────────────────────
+
+static bool lyrics_from_lyricsplus(const std::string& artist, const std::string& title,
+                                   int dur, Lyrics& out) {
+    std::string u = "https://lyricsplus.binimum.org/v2/lyrics/get?title=" +
+                    url_encode_simple(title) + "&artist=" + url_encode_simple(artist);
+    if (dur > 0) u += "&duration=" + std::to_string(dur);
+
+    auto body = http_get(u, 25);
+    if (body.empty()) return false;
+
+    json j;
+    try { j = json::parse(body); } catch (...) { return false; }
+    if (!j.contains("lyrics") || !j["lyrics"].is_array()) return false;
+
+    std::vector<LyricLine> lines;
+    for (const auto& l : j["lyrics"]) {
+        std::string txt = lyr_trim(l.value("text", ""));
+        if (txt.empty()) continue;
+        long long ms = l.value("time", (long long)0);
+        lines.push_back({(double)ms / 1000.0, txt});
+    }
+    if (lines.empty()) return false;
+
+    std::sort(lines.begin(), lines.end(),
+              [](const LyricLine& a, const LyricLine& b) { return a.time_sec < b.time_sec; });
+
+    out.lines = std::move(lines);
+    out.source = "lyricsplus";
+    return true;
+}
+
+Lyrics fetch_lyrics(const std::string& artist_in, const std::string& title_in,
+                    int duration_sec) {
+    Lyrics result;
+    if (artist_in.empty() && title_in.empty()) {
+        result.plain = "No track info available.";
+        return result;
+    }
+
+    std::string artist = artist_in, title = title_in;
+    clean_meta(artist, title);
+
+    // 1) lrclib — exact lookup (duration makes it precise), then search
+    if (lrclib_exact(artist, title, duration_sec, result) && result.synced())
+        return result;
+    if (lrclib_search(artist + " " + title, duration_sec, result) && result.synced())
+        return result;
+
+    // remember a plain/instrumental hit while the other providers are tried
+    std::string plain_fallback = result.plain;
+    bool instrumental = result.instrumental;
+    std::string plain_source = result.source;
+
+    // 2) KuGou
+    Lyrics kg;
+    if (lyrics_from_kugou(artist, title, duration_sec, kg)) return kg;
+
+    // 3) lyricsplus — slowest, so it goes last
+    Lyrics lp;
+    if (lyrics_from_lyricsplus(artist, title, duration_sec, lp)) return lp;
+
+    if (!plain_fallback.empty() || instrumental) {
+        result.lines.clear();
+        result.plain = plain_fallback;
+        result.instrumental = instrumental;
+        result.source = plain_source;
+        return result;
+    }
+
+    // 4) last try: title alone — uploaders often disagree about "the artist"
+    Lyrics t_only;
+    if (lrclib_search(title, duration_sec, t_only) && t_only.synced()) return t_only;
+
+    result.plain = "Lyrics not found for: " + artist + " - " + title;
     return result;
 }
 

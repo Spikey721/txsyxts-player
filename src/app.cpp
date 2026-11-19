@@ -52,7 +52,7 @@ static std::string fmt_time(double secs) {
 
 // ── view modes ─────────────────────────────────────────────────
 
-enum class ViewMode { Home, Playlists, Tracks, Info };
+enum class ViewMode { Home, Playlists, Tracks, Info, Lyrics };
 
 // ── app state ──────────────────────────────────────────────────
 
@@ -74,6 +74,7 @@ struct AppState {
     bool log_error = false;
     std::string info_text;
     Lyrics current_lyrics;
+    ViewMode lyrics_prev_view = ViewMode::Playlists;
     int selected = 0;
     std::unordered_set<int> selected_indices;
     int ytfzf_pid = 0;
@@ -152,7 +153,7 @@ static void play_track(AppState& st, const Track& track, ftxui::ScreenInteractiv
 static void update_ascii_art(AppState& st, const Track& track, ftxui::ScreenInteractive& screen);
 
 static void handle_command(AppState& st, const std::string& raw,
-                           ScreenInteractive& screen) {
+                           ScreenInteractive& screen, bool focus_lyrics = true) {
     auto cmd = parse_command(raw);
     if (!cmd) {
         st.set_log("unknown: " + raw, true);
@@ -570,17 +571,25 @@ static void handle_command(AppState& st, const std::string& raw,
         
         if (title.empty()) { st.set_log("nothing playing", true); return; }
         st.set_log("fetching lyrics...");
-        std::thread([&st, &screen, artist, title]() {
-            Lyrics lyr = fetch_lyrics(artist, title);
+        // Prefer mpv's real duration, fall back to the search metadata.
+        int dur = st.player.duration() > 1.0
+                      ? (int)st.player.duration()
+                      : (int)(st.current_track.duration_ms / 1000);
+        std::thread([&st, &screen, artist, title, dur, focus_lyrics]() {
+            Lyrics lyr = fetch_lyrics(artist, title, dur);
             std::lock_guard<std::mutex> lk(st.mtx);
-            if (lyr.plain.find("Lyrics not found") != std::string::npos || lyr.plain.find("Network error") != std::string::npos) {
+            if (lyr.plain.find("Lyrics not found") != std::string::npos ||
+                lyr.plain.find("Network error") != std::string::npos) {
                 st.set_log(lyr.plain, true);
             } else {
                 st.current_lyrics = lyr;
                 st.info_text = lyr.plain;
-                st.set_log("lyrics loaded");
-                if (lyr.lines.empty()) {
-                    st.view = ViewMode::Info;
+                std::string how = lyr.instrumental ? "instrumental"
+                                                 : (lyr.synced() ? "synced" : "plain");
+                st.set_log("lyrics loaded (" + how + " \u00b7 " + lyr.source + ")");
+                if (focus_lyrics) {
+                    if (st.view != ViewMode::Lyrics) st.lyrics_prev_view = st.view;
+                    st.view = ViewMode::Lyrics;
                 }
             }
             screen.Post(Event::Custom);
@@ -886,8 +895,8 @@ static void on_track_started(AppState& st, const Track& t,
 
     st.current_lyrics = Lyrics();
     if (st.auto_lyrics) {
-        // Automatically invoke the lyrics fetcher
-        handle_command(st, "lyrics", *screen);
+        // Automatically invoke the lyrics fetcher (without stealing the view)
+        handle_command(st, "lyrics", *screen, false);
     }
 
     // Fetch SponsorBlock segments in background
@@ -1025,6 +1034,83 @@ static void update_ascii_art(AppState& st, const Track& track, ftxui::ScreenInte
 }
 
 // ── main app ───────────────────────────────────────────────────
+
+// ── DMS-style lyrics view ─────────────────────────────────────
+// Big centred lyrics: the current line is highlighted and the neighbouring
+// lines fade with distance. Plain-only results are shown as wrapped text,
+// instrumentals get their own marker.
+
+static Element render_lyrics_body(AppState& st, const Lyrics& lyr) {
+    const Color accent = Color::RGB(152, 195, 121);
+
+    std::string title = st.current_track.title;
+    std::string artist = st.current_track.artist;
+    if (title.empty()) title = st.player.current_title();
+    if (title.find("http") == 0 || title.find("googlevideo") != std::string::npos) title.clear();
+
+    Elements content;
+
+    Elements head;
+    if (!title.empty()) head.push_back(text(title) | bold | center);
+    if (!artist.empty()) head.push_back(text(artist) | color(Color::GrayDark) | center);
+    head.push_back(text(""));
+
+    if (lyr.lines.empty() && lyr.plain.empty()) {
+        content.push_back(text(""));
+        content.push_back(text("\u266a  no lyrics loaded") | color(Color::GrayDark) | center);
+        content.push_back(text("press L or :lyrics to fetch") | color(Color::GrayDark) | center);
+    } else if (lyr.instrumental) {
+        content.push_back(text(""));
+        content.push_back(text("\u266a  instrumental  \u266a") | color(accent) | bold | center);
+    } else if (lyr.lines.empty()) {
+        content.push_back(paragraph(lyr.plain) | color(Color::GrayLight) | center | flex);
+    } else {
+        double pos = st.player.predicted_position() + 0.10;
+        int active = -1;
+        for (int i = 0; i < (int)lyr.lines.size(); ++i) {
+            if (pos >= lyr.lines[i].time_sec) active = i;
+            else break;
+        }
+        int center = active < 0 ? 0 : active;
+
+        const int before = 4, after = 5;
+        int start = std::max(0, center - before);
+        int end = std::min((int)lyr.lines.size(), center + after);
+
+        for (int i = start; i < end; ++i) {
+            int dist = active < 0 ? 99 : std::abs(i - active);
+            Color c = dist == 0 ? accent
+                    : dist == 1 ? Color::RGB(200, 200, 200)
+                    : dist == 2 ? Color::RGB(150, 150, 150)
+                    : dist == 3 ? Color::RGB(105, 105, 105)
+                                : Color::RGB(72, 72, 72);
+            Element line = text(lyr.lines[i].text) | color(c);
+            if (dist == 0) line = line | bold;
+            content.push_back(hbox({filler(), line, filler()}));
+            if (dist == 0) content.push_back(text(""));
+        }
+    }
+
+    std::string kind = lyr.instrumental ? "instrumental"
+                     : (lyr.synced() ? "synced" : "plain");
+    std::string src = lyr.source.empty() ? "" : ("  \u00b7  " + lyr.source);
+
+    auto footer = hbox({
+        text("  " + kind + src) | color(Color::GrayDark),
+        filler(),
+        text("[space] pause   [L] close  ") | color(Color::GrayDark),
+    });
+
+    return vbox({
+        vbox(std::move(head)),
+        filler(),
+        vbox(std::move(content)) | center,
+        filler(),
+        separatorEmpty(),
+        footer,
+    }) | flex;
+}
+
 
 int run_app() {
     curl_global_init(CURL_GLOBAL_DEFAULT);
@@ -1206,11 +1292,19 @@ int run_app() {
         input
     });
 
-    // ── render function ────────────────────────────────────────
+// ── render function ────────────────────────────────────────
 
     auto renderer = Renderer(main_container, [&]() {
         // poll mpv events
         st.player.poll_events();
+
+        // Copy lyrics under the lock: the fetch thread replaces them from
+        // another thread, and reading a vector mid-reallocation would crash.
+        Lyrics lyrics_snapshot;
+        {
+            std::lock_guard<std::mutex> lk(st.mtx);
+            lyrics_snapshot = st.current_lyrics;
+        }
 
         // Check SponsorBlock
         if (st.config.sponsorblock_enabled && st.player.is_playing() && !st.sponsor_segments.empty()) {
@@ -1249,7 +1343,9 @@ int run_app() {
 
         // ── track list or info ─────────────────────────────────
         Element body;
-        if (st.view == ViewMode::Info && !st.info_text.empty()) {
+        if (st.view == ViewMode::Lyrics) {
+            body = render_lyrics_body(st, lyrics_snapshot);
+        } else if (st.view == ViewMode::Info && !st.info_text.empty()) {
             body = paragraph(st.info_text) | color(Color::GrayLight) | vscroll_indicator | yframe;
         } else if (st.view == ViewMode::Playlists && !st.playlists.empty()) {
             body = menu_pl->Render() | vscroll_indicator | yframe;
@@ -1349,22 +1445,37 @@ int run_app() {
 
 
         Element lyrics_el = filler();
-        if (!st.current_lyrics.lines.empty()) {
+        const Lyrics& lyr_panel = lyrics_snapshot;
+        if (lyr_panel.instrumental) {
+            lyrics_el = vbox({
+                text("\u266a instrumental") | color(Color::GrayDark) | center,
+                text(lyr_panel.source) | color(Color::RGB(70, 70, 70)) | center,
+            }) | center;
+        } else if (!lyr_panel.lines.empty()) {
             Elements l_els;
-            double pos = st.player.position();
-            int active_idx = -1;
-            for (int i = 0; i < (int)st.current_lyrics.lines.size(); ++i) {
-                if (pos >= st.current_lyrics.lines[i].time_sec) active_idx = i;
+            double pos = st.player.predicted_position() + 0.10;
+            int active_idx = 0;
+            for (int i = 0; i < (int)lyr_panel.lines.size(); ++i) {
+                if (pos >= lyr_panel.lines[i].time_sec) active_idx = i;
+                else break;
             }
             int start = std::max(0, active_idx - 3);
-            int end = std::min((int)st.current_lyrics.lines.size(), active_idx + 4);
+            int end = std::min((int)lyr_panel.lines.size(), active_idx + 4);
             for (int i = start; i < end; ++i) {
                 bool active = (i == active_idx);
-                l_els.push_back(text("  " + st.current_lyrics.lines[i].text) 
-                    | (active ? color(Color::RGB(152, 195, 121)) : color(Color::GrayDark))
-                    | (active ? bold : nothing));
+                int dist = std::abs(i - active_idx);
+                Color c = active ? Color::RGB(152, 195, 121)
+                        : dist == 1 ? Color::RGB(150, 150, 150)
+                                    : Color::RGB(95, 95, 95);
+                l_els.push_back(text("  " + lyr_panel.lines[i].text)
+                    | color(c) | (active ? bold : nothing));
             }
             lyrics_el = vbox(std::move(l_els)) | center;
+        } else if (!lyr_panel.plain.empty() &&
+                   lyr_panel.plain.find("not found") == std::string::npos) {
+            // plain-only result: show the text (dimmed) instead of nothing
+            std::string p = lyr_panel.plain.substr(0, 400);
+            lyrics_el = paragraph(p) | color(Color::RGB(110, 110, 110)) | center;
         }
 
         auto left_panel = vbox({
@@ -1374,10 +1485,17 @@ int run_app() {
             filler()
         }) | size(WIDTH, EQUAL, 60);
 
-        auto main_content = hbox({
-            left_panel,
-            right_panel | flex
-        });
+        // Full-screen lyrics get the whole width; everywhere else keeps the
+        // art + mini-lyrics side panel.
+        Element main_content;
+        if (st.view == ViewMode::Lyrics) {
+            main_content = right_panel | flex;
+        } else {
+            main_content = hbox({
+                left_panel,
+                right_panel | flex
+            });
+        }
 
         auto term_size = ftxui::Terminal::Size();
         auto full_layout = vbox({
@@ -1694,6 +1812,18 @@ int run_app() {
                 } else {
                     st.set_log("not in a local playlist (use Shift+- only in playlist view)", true);
                 }
+            }
+            return true;
+        }
+
+        // Lyrics — full-screen synced view (L toggles)
+        if ((event == Event::Character('L') || event == Event::Character('l')) && input_str.empty()) {
+            if (st.view == ViewMode::Lyrics) {
+                st.view = st.lyrics_prev_view;
+            } else {
+                st.lyrics_prev_view = st.view;
+                st.view = ViewMode::Lyrics;
+                if (st.current_lyrics.empty()) handle_command(st, "lyrics", screen);
             }
             return true;
         }

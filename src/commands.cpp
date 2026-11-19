@@ -101,7 +101,7 @@ const char* HELP_TEXT =
     "  :spotifysetup                  show Spotify setup instructions\n"
     "\n"
     "━━ features & info ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-    "  :lyrics              show lyrics for current track\n"
+    "  :lyrics              lyrics for current track (L opens the view)\n"
     "  :history             show recent play history\n"
     "  :download [url]      download to ~/Music/ via yt-dlp\n"
     "  :sponsorblock on/off toggle SponsorBlock (auto-skip ads)\n"

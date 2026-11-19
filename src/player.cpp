@@ -12,6 +12,8 @@ struct Player::Impl {
     std::string url;               // last stream handed to mpv (for retries)
     double pos = 0.0;
     double dur = 0.0;
+    bool pos_valid = false;
+    std::chrono::steady_clock::time_point pos_stamp;
     bool paused = false;
     bool playing = false;
     bool idle = true;
@@ -110,6 +112,24 @@ void Player::seek_absolute(double pos_sec) {
     std::string s = std::to_string(pos_sec);
     const char* args[] = {"seek", s.c_str(), "absolute", nullptr};
     mpv_command(impl_->mpv, args);
+    impl_->pos = pos_sec;
+    impl_->pos_valid = true;
+    impl_->pos_stamp = std::chrono::steady_clock::now();
+}
+
+// playback-time events only arrive a few times per second; adding the time
+// since the last one keeps the lyrics highlight (and progress bar) smooth
+// between updates — same trick the DMS lyrics widget uses.
+double Player::predicted_position() const {
+    if (!impl_->playing || impl_->paused || !impl_->pos_valid) return impl_->pos;
+
+    double extra = std::chrono::duration<double>(
+                       std::chrono::steady_clock::now() - impl_->pos_stamp).count();
+    if (extra < 0.0 || extra > 0.5) extra = 0.0;
+
+    double p = impl_->pos + extra;
+    if (impl_->dur > 0.0 && p > impl_->dur) p = impl_->dur;
+    return p;
 }
 
 int Player::volume() const {
@@ -163,6 +183,8 @@ void Player::poll_events() {
 
             if (strcmp(prop->name, "playback-time") == 0 && prop->format == MPV_FORMAT_DOUBLE) {
                 impl_->pos = *static_cast<double*>(prop->data);
+                impl_->pos_valid = true;
+                impl_->pos_stamp = std::chrono::steady_clock::now();
             } else if (strcmp(prop->name, "duration") == 0 && prop->format == MPV_FORMAT_DOUBLE) {
                 impl_->dur = *static_cast<double*>(prop->data);
             } else if (strcmp(prop->name, "pause") == 0 && prop->format == MPV_FORMAT_FLAG) {

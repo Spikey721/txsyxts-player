@@ -34,12 +34,17 @@ struct LyricLine {
 struct Lyrics {
     std::vector<LyricLine> lines;
     std::string plain;
+    std::string source;          // "lrclib", "kugou", "lyricsplus"
+    bool instrumental = false;
     bool empty() const { return lines.empty() && plain.empty(); }
+    bool synced() const { return !lines.empty(); }
 };
 
-// Fetches lyrics from lrclib.net (free, no auth). Returns formatted text or
-// an error message string.
-Lyrics fetch_lyrics(const std::string& artist, const std::string& title);
+// Fetches lyrics with a provider fallback chain (lrclib → KuGou → lyricsplus).
+// duration_sec (optional) makes matching far more accurate. Returns timed
+// lines when available, otherwise plain text, otherwise a "not found" message.
+Lyrics fetch_lyrics(const std::string& artist, const std::string& title,
+                    int duration_sec = 0);
 
 // ── Podcast / RSS ─────────────────────────────────────────────────────────────
 // Parse a podcast RSS feed URL and return episodes as Track objects.

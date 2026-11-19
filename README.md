@@ -10,7 +10,7 @@ minimal tui music player for linux. native c++ binary — just run `txsyxts`.
 
 - **youtube** — search and stream directly via yt-dlp + mpv
 - **radio mix** — automatically queues similar songs to keep the music playing seamlessly (Spotify-style)
-- **lyrics** — real-time scrolling, time-synced lyrics with auto-fetch toggle
+- **lyrics** — DMS-style full-screen synced lyrics (`L`), multi-provider lookup (lrclib → KuGou → lyricsplus), instrumental detection
 - **local** — play .mp3 / .flac / .ogg / .opus / .wav files from disk
 - **local playlists** — instantly build and manage custom playlists on disk
 - **visualizer** — high resolution sub-pixel braille wave visualizer
@@ -108,7 +108,7 @@ When present, `install.sh` will build `txsyxts-login` automatically.
 | `:pause` / `:p` | toggle pause |
 | `:next` / `:n` | next track |
 | `:prev` | previous track |
-| `:lyrics` | manually fetch lyrics for the current song |
+| `:lyrics` | fetch lyrics and open the full-screen view (`L` toggles it) |
 | `:stop` / `:s` | stop playback |
 | `:seek <±sec>` | seek forward/back |
 | `:vol <0-100>` | set volume |
