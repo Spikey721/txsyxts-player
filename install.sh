@@ -220,20 +220,28 @@ build_project() {
     cmake .. -DCMAKE_BUILD_TYPE=Release 2>&1 | grep -E "(STATUS|error|warning|Building)" || true
     echo -e "  ${DIM}→ compiling (using $(nproc) cores)...${NC}"
     make -j"$(nproc)" 2>&1
+    # Optional WebKit helper: never let it fail the main build.
+    if grep -q "TXSYXTS_LOGIN_HELPER:BOOL=ON" CMakeCache.txt 2>/dev/null; then
+        echo -e "  ${DIM}→ building optional login helper...${NC}"
+        make -j"$(nproc)" txsyxts-login 2>/dev/null || \
+            echo -e "  ${YELLOW}!${NC} login helper could not be linked (WebKit deps) — skipped"
+    fi
     cd ..
 }
 
 # ── install binary ─────────────────────────────────────────────────────────────
 install_binary() {
     echo ""
+    LOGIN_ENABLED=0
+    grep -q "TXSYXTS_LOGIN_HELPER:BOOL=ON" build/CMakeCache.txt 2>/dev/null && LOGIN_ENABLED=1
     if [ -f build/txsyxts ]; then
         echo -e "${GREEN}✓ build successful!${NC}"
-        [ -f build/txsyxts-login ] && echo -e "  ${GREEN}✓${NC} login helper built (browser login enabled)"
+        [ "$LOGIN_ENABLED" = 1 ] && [ -f build/txsyxts-login ] && echo -e "  ${GREEN}✓${NC} login helper built (browser login enabled)"
         echo ""
         read -rp "  Install to /usr/local/bin? (needs sudo) [y/N] " yn
         if [[ "$yn" =~ ^[Yy]$ ]]; then
             sudo cp build/txsyxts /usr/local/bin/txsyxts
-            [ -f build/txsyxts-login ] && sudo cp build/txsyxts-login /usr/local/bin/txsyxts-login
+            [ "$LOGIN_ENABLED" = 1 ] && [ -f build/txsyxts-login ] && sudo cp build/txsyxts-login /usr/local/bin/txsyxts-login
             echo -e "${GREEN}installed!${NC} run: ${BOLD}txsyxts${NC}"
         else
             echo -e "  binary at: ${BOLD}./build/txsyxts${NC}"

@@ -74,12 +74,18 @@ target_link_libraries(txsyxts PRIVATE
 target_compile_options(txsyxts PRIVATE -Wall -Wextra -O2)
 
 # ── login helper (webkit2gtk) ───────────────────────────────────
+# Optional: WebKit drags in a large dependency graph, and a partially
+# upgraded system can have a webkit2gtk built against a newer soname than
+# is installed. Keep it out of `all` so it can never break the main build;
+# enable explicitly with -DTXSYXTS_LOGIN_HELPER=ON.
+option(TXSYXTS_LOGIN_HELPER "Build the WebKit Spotify login helper" OFF)
+
 pkg_check_modules(WEBKIT2GTK webkit2gtk-4.1)
 pkg_check_modules(GTK3 gtk+-3.0)
 
-if(WEBKIT2GTK_FOUND AND GTK3_FOUND)
+if(TXSYXTS_LOGIN_HELPER AND WEBKIT2GTK_FOUND AND GTK3_FOUND)
   message(STATUS "Building login helper (webkit2gtk found)")
-  add_executable(txsyxts-login
+  add_executable(txsyxts-login EXCLUDE_FROM_ALL
     src/login_window.cpp
     src/config.cpp
   )
@@ -94,8 +100,10 @@ if(WEBKIT2GTK_FOUND AND GTK3_FOUND)
   )
   target_compile_options(txsyxts-login PRIVATE -Wall -O2)
   install(TARGETS txsyxts-login DESTINATION bin)
+elseif(TXSYXTS_LOGIN_HELPER)
+  message(WARNING "login helper requested but webkit2gtk-4.1/gtk+-3.0 not found — skipping")
 else()
-  message(STATUS "webkit2gtk not found — login helper disabled (manual sp_dc only)")
+  message(STATUS "login helper disabled (build with -DTXSYXTS_LOGIN_HELPER=ON)")
 endif()
 
 # ── install ─────────────────────────────────────────────────────
