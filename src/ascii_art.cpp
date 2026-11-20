@@ -7,6 +7,9 @@
 #include <ftxui/screen/color.hpp>
 #include <atomic>
 #include <cstdio>
+#include <cstring>
+#include <fcntl.h>
+#include <unistd.h>
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -15,15 +18,17 @@ using namespace ftxui;
 
 namespace txs {
 
-// Kitty graphics are placed on top of the text grid and survive normal
-// redraws. Whenever the cover moves (main view <-> lyrics view) the old
-// placement has to be deleted explicitly.
 static std::atomic<uint64_t> g_art_generation{0};
 
 void invalidate_art_images() {
     ++g_art_generation;
-    fputs("\033_Ga=d\033\\", stdout);
-    fflush(stdout);
+    // Delete all kitty placements directly on /dev/tty
+    int tty = open("/dev/tty", O_WRONLY);
+    if (tty >= 0) {
+        const char* del = "\033_Ga=d\033\\";
+        write(tty, del, strlen(del));
+        close(tty);
+    }
 }
 
 static size_t write_memory_cb(void* contents, size_t size, size_t nmemb, void* userp) {
@@ -33,13 +38,91 @@ static size_t write_memory_cb(void* contents, size_t size, size_t nmemb, void* u
     return realsize;
 }
 
-// We use Kitty's t=f mode to transmit the file directly. 
-// Base64 of "/tmp/txsart.jpg" is "L3RtcC90eHNhcnQuanBn"
+static std::string base64_encode(const std::vector<uint8_t>& in) {
+    static const char* tbl =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve(((in.size() + 2) / 3) * 4);
+    for (size_t i = 0; i < in.size(); i += 3) {
+        unsigned int b = (unsigned int)in[i] << 16;
+        if (i + 1 < in.size()) b |= (unsigned int)in[i + 1] << 8;
+        if (i + 2 < in.size()) b |= (unsigned int)in[i + 2];
+        out += tbl[(b >> 18) & 0x3f];
+        out += tbl[(b >> 12) & 0x3f];
+        out += (i + 1 < in.size()) ? tbl[(b >> 6) & 0x3f] : '=';
+        out += (i + 2 < in.size()) ? tbl[b & 0x3f] : '=';
+    }
+    return out;
+}
+
+// Send the Kitty Graphics Protocol image directly to /dev/tty.
+// We write chunked APC sequences (max 4096 bytes of base64 per chunk).
+// a=T  = transmit + display
+// t=d  = raw pixel data (RGBA)
+// f=32 = RGBA format
+// s=W,v=H = pixel dimensions
+// c=cols,r=rows = terminal cell size
+// m=1/0 = more chunks / last chunk
+static void kitty_send_image(int tty_fd,
+                              const uint8_t* rgba, int px_w, int px_h,
+                              int col, int row,
+                              int w_cells, int h_cells) {
+    // Delete previous placements first
+    std::string del = "\033_Ga=d\033\\";
+    write(tty_fd, del.data(), del.size());
+
+    // Move cursor to the target position using ANSI escape before transmitting.
+    // Kitty places the image at the current cursor position.
+    std::string move = "\033[" + std::to_string(row + 1) + ";" +
+                                 std::to_string(col + 1) + "H";
+    write(tty_fd, move.data(), move.size());
+
+    // Base64-encode all RGBA pixels
+    std::vector<uint8_t> raw(rgba, rgba + px_w * px_h * 4);
+    std::string b64 = base64_encode(raw);
+
+    const size_t CHUNK = 4096;
+    size_t offset = 0;
+    bool first = true;
+    while (offset < b64.size()) {
+        size_t end = std::min(offset + CHUNK, b64.size());
+        bool last = (end >= b64.size());
+        std::string chunk = b64.substr(offset, end - offset);
+        offset = end;
+
+        std::string seq;
+        if (first) {
+            // First chunk: include all parameters
+            seq = "\033_Ga=T,t=d,f=32"
+                  ",s=" + std::to_string(px_w) +
+                  ",v=" + std::to_string(px_h) +
+                  ",c=" + std::to_string(w_cells) +
+                  ",r=" + std::to_string(h_cells) +
+                  ",m=" + (last ? "0" : "1") +
+                  ";" + chunk + "\033\\";
+            first = false;
+        } else {
+            // Continuation chunks: only m= key
+            seq = "\033_Gm=" + std::string(last ? "0" : "1") +
+                  ";" + chunk + "\033\\";
+        }
+        write(tty_fd, seq.data(), seq.size());
+    }
+}
+
+// Stored decoded image for rendering
+struct DecodedImage {
+    std::vector<uint8_t> rgba;
+    int px_w = 0, px_h = 0;
+    int cell_w = 0, cell_h = 0;
+};
+
+static std::shared_ptr<DecodedImage> g_decoded_image;
+
 class KittyImageNode : public ftxui::Node {
 public:
-    KittyImageNode(int width, int height)
-        : width_(width), height_(height) {
-    }
+    KittyImageNode(int width, int height, std::shared_ptr<DecodedImage> img)
+        : width_(width), height_(height), img_(std::move(img)) {}
 
     void ComputeRequirement() override {
         requirement_.min_x = width_;
@@ -52,44 +135,42 @@ public:
 
     void Render(ftxui::Screen& screen) override {
         uint64_t gen = g_art_generation.load();
-        if (!uploaded_ || gen_ != gen ||
-            last_x_ != box_.x_min || last_y_ != box_.y_min) {
+        bool pos_changed = (last_x_ != box_.x_min || last_y_ != box_.y_min);
+        bool gen_changed = (gen_ != gen);
+
+        if (!uploaded_ || pos_changed || gen_changed) {
             gen_ = gen;
             last_x_ = box_.x_min;
             last_y_ = box_.y_min;
-            seq_.clear();
-            // drop whatever image was on screen before placing this one
-            seq_ += "\033_Ga=d\033\\";
-
-            // Use kitty +kitten icat directly to bypass any manual protocol logic!
-            // We tell it to place the image exactly inside our box dimensions.
-            std::string cmd = "kitty +kitten icat --transfer-mode=file --scale-up --place " + 
-                              std::to_string(width_) + "x" + std::to_string(height_) + "@" + 
-                              std::to_string(box_.x_min) + "x" + std::to_string(box_.y_min) + 
-                              " /tmp/txsart.jpg 2>/dev/null";
-            
-            FILE* pipe = popen(cmd.c_str(), "r");
-            if (pipe) {
-                char buffer[128];
-                while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-                    seq_ += buffer;
-                }
-                pclose(pipe);
-            }
             uploaded_ = true;
+
+            if (img_ && !img_->rgba.empty()) {
+                int tty_fd = open("/dev/tty", O_WRONLY);
+                if (tty_fd >= 0) {
+                    kitty_send_image(tty_fd,
+                                     img_->rgba.data(),
+                                     img_->px_w, img_->px_h,
+                                     box_.x_min, box_.y_min,
+                                     width_, height_);
+                    close(tty_fd);
+                }
+            }
         }
 
-        // Put the sequence in the top-left pixel.
-        screen.PixelAt(box_.x_min, box_.y_min).character = seq_;
+        // Reserve the space in the FTXUI layout (blank cells — image is an overlay)
+        for (int y = box_.y_min; y <= box_.y_max; ++y) {
+            for (int x = box_.x_min; x <= box_.x_max; ++x) {
+                screen.PixelAt(x, y).character = " ";
+            }
+        }
     }
 
 private:
     int width_, height_;
-    int last_x_ = -1;
-    int last_y_ = -1;
+    std::shared_ptr<DecodedImage> img_;
+    int last_x_ = -1, last_y_ = -1;
     bool uploaded_ = false;
     uint64_t gen_ = 0;
-    std::string seq_;
 };
 
 Element fetch_ascii_art(const std::string& url, int target_width, int target_height) {
@@ -109,28 +190,28 @@ Element fetch_ascii_art(const std::string& url, int target_width, int target_hei
         curl_easy_cleanup(curl);
     }
 
-    if (buffer.empty()) {
-        return text("");
-    }
+    if (buffer.empty()) return text("");
 
-    // 2. Determine aspect ratio and calculate dynamic height
-    int w = 0, h = 0, comp = 0;
-    stbi_info_from_memory(buffer.data(), buffer.size(), &w, &h, &comp);
-    
-    if (w > 0 && h > 0) {
-        // A terminal cell is roughly twice as tall as it is wide.
-        target_height = (target_width * h) / (w * 2);
-    }
+    // 2. Decode image to RGBA pixels
+    int px_w = 0, px_h = 0, comp = 0;
+    uint8_t* pixels = stbi_load_from_memory(buffer.data(), (int)buffer.size(),
+                                             &px_w, &px_h, &comp, 4);
+    if (!pixels || px_w <= 0 || px_h <= 0) return text("");
 
-    // Save as is to /tmp/txsart.jpg
-    FILE* fp = fopen("/tmp/txsart.jpg", "wb");
-    if (fp) {
-        fwrite(buffer.data(), 1, buffer.size(), fp);
-        fclose(fp);
-    }
+    // Adjust cell height to preserve aspect ratio (terminal cell ~= 2:1 h/w)
+    target_height = (target_width * px_h) / (px_w * 2);
+    if (target_height < 1) target_height = 1;
 
-    // 2. Return Kitty graphics node
-    return std::make_shared<KittyImageNode>(target_width, target_height);
+    auto img = std::make_shared<DecodedImage>();
+    img->rgba.assign(pixels, pixels + px_w * px_h * 4);
+    img->px_w = px_w;
+    img->px_h = px_h;
+    img->cell_w = target_width;
+    img->cell_h = target_height;
+    stbi_image_free(pixels);
+
+    g_decoded_image = img;
+    return std::make_shared<KittyImageNode>(target_width, target_height, img);
 }
 
 } // namespace txs
