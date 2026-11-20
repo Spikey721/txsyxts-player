@@ -26,6 +26,42 @@ namespace fs = std::filesystem;
 
 namespace txs {
 
+// ── tolerant JSON accessors ────────────────────────────────────
+// yt-dlp and the lyric providers regularly emit `"key": null` (live
+// streams have no duration, some KuGou rows no hash). nlohmann's
+// json::value() throws type_error.302 for those, and an exception in the
+// background lyrics thread aborts the whole app — so never call it with a
+// numeric/string default on untrusted payloads.
+
+static bool jhas(const json& o, const char* key) {
+    return o.is_object() && o.find(key) != o.end();
+}
+
+static double jnum(const json& o, const char* key, double def = 0.0) {
+    if (!jhas(o, key)) return def;
+    const auto& v = o[key];
+    if (!v.is_number()) return def;
+    return v.get<double>();
+}
+
+static long long jint(const json& o, const char* key, long long def = 0) {
+    return (long long)std::llround(jnum(o, key, (double)def));
+}
+
+static std::string jstr(const json& o, const char* key, const std::string& def = "") {
+    if (!jhas(o, key)) return def;
+    const auto& v = o[key];
+    if (!v.is_string()) return def;
+    return v.get<std::string>();
+}
+
+static bool jbool(const json& o, const char* key, bool def = false) {
+    if (!jhas(o, key)) return def;
+    const auto& v = o[key];
+    if (!v.is_boolean()) return def;
+    return v.get<bool>();
+}
+
 // ── shell exec helper ──────────────────────────────────────────
 
 static std::string exec_cmd(const std::string& cmd) {
@@ -110,17 +146,18 @@ std::vector<Track> yt_search(const std::string& query, int max_results) {
         try {
             auto j = json::parse(line);
             Track t;
-            t.title = j.value("title", "Unknown");
-            t.artist = j.value("uploader", j.value("channel", ""));
-            t.duration_ms = j.value("duration", 0) * 1000;
+            t.title = jstr(j, "title", "Unknown");
+            t.artist = jstr(j, "uploader", jstr(j, "channel"));
+            t.duration_ms = jint(j, "duration") * 1000;
             t.source = "youtube";
-            t.uri = j.value("url", j.value("webpage_url", ""));
-            if (t.uri.empty() && j.contains("id")) {
-                t.uri = "https://www.youtube.com/watch?v=" + j["id"].get<std::string>();
+            t.uri = jstr(j, "url", jstr(j, "webpage_url"));
+            std::string vid = jstr(j, "id");
+            if (t.uri.empty() && !vid.empty()) {
+                t.uri = "https://www.youtube.com/watch?v=" + vid;
             }
             if (j.contains("thumbnails") && j["thumbnails"].is_array() && !j["thumbnails"].empty()) {
                 auto thumbs = j["thumbnails"];
-                std::string raw_url = thumbs.back().value("url", "");
+                std::string raw_url = jstr(thumbs.back(), "url");
                 auto pos = raw_url.find("?");
                 if (pos != std::string::npos) raw_url = raw_url.substr(0, pos);
                 t.thumbnail_url = raw_url;
@@ -169,17 +206,18 @@ std::vector<Track> yt_get_similar(const std::string& uri, int max_results) {
         try {
             auto j = json::parse(line);
             Track t;
-            t.title = j.value("title", "Unknown");
-            t.artist = j.value("uploader", j.value("channel", ""));
-            t.duration_ms = j.value("duration", 0) * 1000;
+            t.title = jstr(j, "title", "Unknown");
+            t.artist = jstr(j, "uploader", jstr(j, "channel"));
+            t.duration_ms = jint(j, "duration") * 1000;
             t.source = "youtube";
-            t.uri = j.value("url", j.value("webpage_url", ""));
-            if (t.uri.empty() && j.contains("id")) {
-                t.uri = "https://www.youtube.com/watch?v=" + j["id"].get<std::string>();
+            t.uri = jstr(j, "url", jstr(j, "webpage_url"));
+            std::string vid = jstr(j, "id");
+            if (t.uri.empty() && !vid.empty()) {
+                t.uri = "https://www.youtube.com/watch?v=" + vid;
             }
             if (j.contains("thumbnails") && j["thumbnails"].is_array() && !j["thumbnails"].empty()) {
                 auto thumbs = j["thumbnails"];
-                std::string raw_url = thumbs.back().value("url", "");
+                std::string raw_url = jstr(thumbs.back(), "url");
                 auto qpos = raw_url.find("?");
                 if (qpos != std::string::npos) raw_url = raw_url.substr(0, qpos);
                 t.thumbnail_url = raw_url;
@@ -207,17 +245,18 @@ std::vector<Track> yt_fetch_playlist(const std::string& url, int max_results) {
         try {
             auto j = json::parse(line);
             Track t;
-            t.title = j.value("title", "Unknown");
-            t.artist = j.value("uploader", j.value("channel", ""));
-            t.duration_ms = j.value("duration", 0) * 1000;
+            t.title = jstr(j, "title", "Unknown");
+            t.artist = jstr(j, "uploader", jstr(j, "channel"));
+            t.duration_ms = jint(j, "duration") * 1000;
             t.source = "youtube";
-            t.uri = j.value("url", j.value("webpage_url", ""));
-            if (t.uri.empty() && j.contains("id")) {
-                t.uri = "https://www.youtube.com/watch?v=" + j["id"].get<std::string>();
+            t.uri = jstr(j, "url", jstr(j, "webpage_url"));
+            std::string vid = jstr(j, "id");
+            if (t.uri.empty() && !vid.empty()) {
+                t.uri = "https://www.youtube.com/watch?v=" + vid;
             }
             if (j.contains("thumbnails") && j["thumbnails"].is_array() && !j["thumbnails"].empty()) {
                 auto thumbs = j["thumbnails"];
-                std::string raw_url = thumbs.back().value("url", "");
+                std::string raw_url = jstr(thumbs.back(), "url");
                 auto qpos = raw_url.find("?");
                 if (qpos != std::string::npos) raw_url = raw_url.substr(0, qpos);
                 t.thumbnail_url = raw_url;
@@ -650,13 +689,13 @@ static void parse_lrc(const std::string& raw, std::vector<LyricLine>& out) {
 
 static void lrclib_fill(const json& o, Lyrics& out) {
     out.source = "lrclib";
-    out.instrumental = o.value("instrumental", false);
+    out.instrumental = jbool(o, "instrumental");
 
-    if (o.contains("syncedLyrics") && !o["syncedLyrics"].is_null())
-        parse_lrc(o["syncedLyrics"].get<std::string>(), out.lines);
+    std::string synced = jstr(o, "syncedLyrics");
+    if (!synced.empty()) parse_lrc(synced, out.lines);
 
-    if (o.contains("plainLyrics") && !o["plainLyrics"].is_null()) {
-        std::string plain = o["plainLyrics"].get<std::string>();
+    std::string plain = jstr(o, "plainLyrics");
+    if (!plain.empty()) {
         // some entries ship LRC inside plainLyrics
         if (out.lines.empty() && plain.find("[0") != std::string::npos)
             parse_lrc(plain, out.lines);
@@ -696,12 +735,11 @@ static bool lrclib_search(const std::string& q, int dur, Lyrics& out) {
         const auto& o = j[i];
         int score = 0;
 
-        bool synced = o.contains("syncedLyrics") && !o["syncedLyrics"].is_null() &&
-                      o["syncedLyrics"].get<std::string>().size() > 20;
+        bool synced = jstr(o, "syncedLyrics").size() > 20;
         if (synced) score += 4;
-        if (o.value("instrumental", false)) score += 1;
+        if (jbool(o, "instrumental")) score += 1;
 
-        double d = o.value("duration", 0.0);
+        double d = jnum(o, "duration");
         if (dur > 0 && d > 1.0) {
             double diff = std::abs(d - (double)dur);
             if (diff <= 2.0) score += 5;
@@ -738,9 +776,9 @@ static bool lyrics_from_kugou(const std::string& artist, const std::string& titl
     for (const auto& s : j["data"]["info"]) {
         if (tried++ >= 4) break;
 
-        std::string hash = s.value("hash", "");
-        std::string name = s.value("songname", title);
-        int sdur = s.value("duration", 0);
+        std::string hash = jstr(s, "hash");
+        std::string name = jstr(s, "songname", title);
+        int sdur = (int)jint(s, "duration");
         if (hash.empty()) continue;
         // skip wildly different versions (live/karaoke/remix)
         if (dur > 0 && sdur > 0 && std::abs(sdur / 1000 - dur) > 20) continue;
@@ -756,7 +794,7 @@ static bool lyrics_from_kugou(const std::string& artist, const std::string& titl
             sj["candidates"].empty()) continue;
 
         const auto& c = sj["candidates"][0];
-        std::string id = c.value("id", ""), key = c.value("accesskey", "");
+        std::string id = jstr(c, "id"), key = jstr(c, "accesskey");
         if (id.empty() || key.empty()) continue;
 
         auto db = http_get("https://lyrics.kugou.com/download?ver=1&client=pc&fmt=lrc"
@@ -771,13 +809,20 @@ static bool lyrics_from_kugou(const std::string& artist, const std::string& titl
         parse_lrc(b64_decode(dj["content"].get<std::string>()), lines);
         if (lines.empty()) continue;
 
-        // KuGou LRC files usually open with a "Title - Artist" credit line
+        // KuGou LRC files usually open with a "Title - Artist" credit line.
+        // The song part is everything after the last " - " of the title
+        // ("Arash feat. Helena - Broken Angel" → "Broken Angel").
+        std::string core = title;
+        auto dash = core.rfind(" - ");
+        if (dash != std::string::npos) core = core.substr(dash + 3);
+        for (auto& ch : core) ch = (char)tolower((unsigned char)ch);
+
         auto is_credit = [&](const LyricLine& l) {
             if (l.time_sec > 5.0) return false;
-            std::string t = l.text, tt = title;
+            std::string t = l.text;
             for (auto& ch : t) ch = (char)tolower((unsigned char)ch);
-            for (auto& ch : tt) ch = (char)tolower((unsigned char)ch);
-            return !tt.empty() && t.find(tt) != std::string::npos && t.find(" - ") != std::string::npos;
+            if (t.find(" - ") == std::string::npos) return false;
+            return core.empty() || t.find(core) != std::string::npos;
         };
         lines.erase(std::remove_if(lines.begin(), lines.end(), is_credit), lines.end());
         if (lines.empty()) continue;
@@ -824,9 +869,9 @@ static bool lyrics_from_lyricsplus(const std::string& artist, const std::string&
 
     std::vector<LyricLine> lines;
     for (const auto& l : j["lyrics"]) {
-        std::string txt = lyr_trim(l.value("text", ""));
+        std::string txt = lyr_trim(jstr(l, "text"));
         if (txt.empty()) continue;
-        long long ms = l.value("time", (long long)0);
+        long long ms = jint(l, "time");
         lines.push_back({(double)ms / 1000.0, txt});
     }
     if (lines.empty()) return false;
@@ -839,8 +884,8 @@ static bool lyrics_from_lyricsplus(const std::string& artist, const std::string&
     return true;
 }
 
-Lyrics fetch_lyrics(const std::string& artist_in, const std::string& title_in,
-                    int duration_sec) {
+static Lyrics fetch_lyrics_impl(const std::string& artist_in, const std::string& title_in,
+                               int duration_sec) {
     Lyrics result;
     if (artist_in.empty() && title_in.empty()) {
         result.plain = "No track info available.";
@@ -883,6 +928,24 @@ Lyrics fetch_lyrics(const std::string& artist_in, const std::string& title_in,
 
     result.plain = "Lyrics not found for: " + artist + " - " + title;
     return result;
+}
+
+// Provider payloads are third-party and change without notice. A parse
+// failure must never escape this function: the fetch runs on a detached
+// thread, where an uncaught exception means std::terminate (SIGABRT).
+Lyrics fetch_lyrics(const std::string& artist_in, const std::string& title_in,
+                    int duration_sec) {
+    try {
+        return fetch_lyrics_impl(artist_in, title_in, duration_sec);
+    } catch (const std::exception& e) {
+        Lyrics l;
+        l.plain = std::string("Lyrics lookup failed: ") + e.what();
+        return l;
+    } catch (...) {
+        Lyrics l;
+        l.plain = "Lyrics lookup failed";
+        return l;
+    }
 }
 
 // ── Podcast RSS ───────────────────────────────────────────────────────────────

@@ -621,10 +621,17 @@ static void handle_command(AppState& st, const std::string& raw,
                       ? (int)st.player.duration()
                       : (int)(st.current_track.duration_ms / 1000);
         std::thread([&st, &screen, artist, title, dur, focus_lyrics]() {
-            Lyrics lyr = fetch_lyrics(artist, title, dur);
+            Lyrics lyr;
+            try {
+                lyr = fetch_lyrics(artist, title, dur);
+            } catch (...) {
+                // never let the detached thread die uncaught (SIGABRT)
+                lyr.plain = "Lyrics lookup failed";
+            }
             std::lock_guard<std::mutex> lk(st.mtx);
             if (lyr.plain.find("Lyrics not found") != std::string::npos ||
-                lyr.plain.find("Network error") != std::string::npos) {
+                lyr.plain.find("Network error") != std::string::npos ||
+                lyr.plain.find("lookup failed") != std::string::npos) {
                 st.set_log(lyr.plain, true);
             } else {
                 st.current_lyrics = lyr;

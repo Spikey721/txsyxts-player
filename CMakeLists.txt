@@ -50,7 +50,7 @@ add_executable(txsyxts
 )
 
 target_compile_definitions(txsyxts PRIVATE
-  TXSYXTS_BUILD_TAG="warmup-3-ui"
+  TXSYXTS_BUILD_TAG="warmup-4-crashfix"
 )
 
 target_include_directories(txsyxts PRIVATE

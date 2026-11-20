@@ -215,9 +215,17 @@ void Player::poll_events() {
                 if (prop->data) {
                     char* title_str = *static_cast<char**>(prop->data);
                     if (title_str) {
-                        // Radio stream metadata updates via media-title
+                        // Radio stream metadata updates via media-title, but for
+                        // direct googlevideo playback mpv reports the stream URL.
+                        // Keep the title we were given in that case.
                         std::string mt = title_str;
-                        if (mt != impl_->title && !mt.empty()) {
+                        bool looks_like_url =
+                            mt.rfind("http", 0) == 0 ||
+                            mt.find("googlevideo") != std::string::npos ||
+                            mt.find("&ns=") != std::string::npos ||
+                            mt.find("expire=") != std::string::npos ||
+                            mt.find(".mp4") != std::string::npos;
+                        if (!looks_like_url && mt != impl_->title && !mt.empty()) {
                             impl_->title = mt;
                         }
                     }
