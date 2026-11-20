@@ -1092,7 +1092,7 @@ static void update_ascii_art(AppState& st, const Track& track, ftxui::ScreenInte
 // lines fade with distance. Plain-only results are shown as wrapped text,
 // instrumentals get their own marker.
 
-static Element render_lyrics_body(AppState& st, const Lyrics& lyr) {
+static Element render_lyrics_body(AppState& st, const Lyrics& lyr, int max_w) {
     const Color accent = Color::RGB(152, 195, 121);
 
     std::string title = st.current_track.title;
@@ -1100,7 +1100,7 @@ static Element render_lyrics_body(AppState& st, const Lyrics& lyr) {
     if (title.empty()) title = st.player.current_title();
     if (title.find("http") == 0 || title.find("googlevideo") != std::string::npos) title.clear();
     title = strip_artist_prefix(title, artist);
-    title = ellipsize(title, std::max(20, ftxui::Terminal::Size().dimx - 8));
+    title = ellipsize(title, std::max(16, max_w - 2));
 
     Elements content;
 
@@ -1138,11 +1138,40 @@ static Element render_lyrics_body(AppState& st, const Lyrics& lyr) {
                     : dist == 2 ? Color::RGB(150, 150, 150)
                     : dist == 3 ? Color::RGB(105, 105, 105)
                                 : Color::RGB(72, 72, 72);
-            Element line = text(lyr.lines[i].text) | color(c);
+            Element line = text(ellipsize(lyr.lines[i].text, max_w)) | color(c);
             if (dist == 0) line = line | bold;
             content.push_back(hbox({filler(), line, filler()}));
             if (dist == 0) content.push_back(text(""));
         }
+    }
+
+    return vbox({
+        vbox(std::move(head)),
+        filler(),
+        vbox(std::move(content)),
+        filler(),
+    }) | flex;
+}
+
+// Full-screen lyrics: the cover sits in its own column on the right, the
+// lyrics stay centred in the remaining (slightly left-of-centre) space.
+static Element render_lyrics_view(AppState& st, const Lyrics& lyr, Element header) {
+    const int dimx = ftxui::Terminal::Size().dimx;
+    const int art_w = 56;
+    const bool show_art = !st.current_art_url.empty() && dimx >= art_w + 46;
+
+    int lyrics_w = dimx - (show_art ? art_w + 6 : 2);
+    lyrics_w = std::max(20, lyrics_w);
+
+    Elements cols;
+    cols.push_back(render_lyrics_body(st, lyr, lyrics_w) | flex);
+    if (show_art) {
+        cols.push_back(text("  "));
+        cols.push_back(vbox({
+            filler(),
+            st.current_art,
+            filler(),
+        }) | size(WIDTH, EQUAL, art_w));
     }
 
     std::string kind = lyr.instrumental ? "instrumental"
@@ -1156,13 +1185,12 @@ static Element render_lyrics_body(AppState& st, const Lyrics& lyr) {
     });
 
     return vbox({
-        vbox(std::move(head)),
-        filler(),
-        vbox(std::move(content)) | center,
-        filler(),
-        separatorEmpty(),
+        hbox({text("  "), header | flex}),
+        separator() | color(Color::RGB(34, 34, 34)),
+        hbox(std::move(cols)) | flex,
+        separator() | color(Color::RGB(34, 34, 34)),
         footer,
-    }) | flex;
+    });
 }
 
 
@@ -1446,10 +1474,8 @@ int run_app() {
         });
 
         // ── track list or info ─────────────────────────────────
-        Element body;
-        if (st.view == ViewMode::Lyrics) {
-            body = render_lyrics_body(st, lyrics_snapshot);
-        } else if (st.view == ViewMode::Info && !st.info_text.empty()) {
+        Element body = text("");
+        if (st.view == ViewMode::Info && !st.info_text.empty()) {
             body = paragraph(st.info_text) | color(Color::GrayLight) | vscroll_indicator | yframe;
         } else if (st.view == ViewMode::Playlists && !st.playlists.empty()) {
             body = menu_pl->Render() | vscroll_indicator | yframe;
@@ -1603,11 +1629,11 @@ int run_app() {
             filler()
         }) | size(WIDTH, EQUAL, 60);
 
-        // Full-screen lyrics get the whole width; everywhere else keeps the
-        // art + mini-lyrics side panel.
+        // Full-screen lyrics get their own layout (lyrics left, cover right);
+        // everywhere else keeps the art + mini-lyrics side panel.
         Element main_content;
         if (st.view == ViewMode::Lyrics) {
-            main_content = right_panel | flex;
+            main_content = render_lyrics_view(st, lyrics_snapshot, header) | flex;
         } else {
             main_content = hbox({
                 left_panel,
@@ -1936,6 +1962,9 @@ int run_app() {
 
         // Lyrics — full-screen synced view (L toggles)
         if ((event == Event::Character('L') || event == Event::Character('l')) && input_str.empty()) {
+            // the cover is drawn with the kitty protocol and survives text
+            // redraws, so clear it when the layout changes
+            invalidate_art_images();
             if (st.view == ViewMode::Lyrics) {
                 st.view = st.lyrics_prev_view;
             } else {

@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <ftxui/dom/elements.hpp>
 #include <ftxui/screen/color.hpp>
+#include <atomic>
+#include <cstdio>
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -12,6 +14,17 @@
 using namespace ftxui;
 
 namespace txs {
+
+// Kitty graphics are placed on top of the text grid and survive normal
+// redraws. Whenever the cover moves (main view <-> lyrics view) the old
+// placement has to be deleted explicitly.
+static std::atomic<uint64_t> g_art_generation{0};
+
+void invalidate_art_images() {
+    ++g_art_generation;
+    fputs("\033_Ga=d\033\\", stdout);
+    fflush(stdout);
+}
 
 static size_t write_memory_cb(void* contents, size_t size, size_t nmemb, void* userp) {
     size_t realsize = size * nmemb;
@@ -38,10 +51,15 @@ public:
     }
 
     void Render(ftxui::Screen& screen) override {
-        if (!uploaded_ || last_x_ != box_.x_min || last_y_ != box_.y_min) {
+        uint64_t gen = g_art_generation.load();
+        if (!uploaded_ || gen_ != gen ||
+            last_x_ != box_.x_min || last_y_ != box_.y_min) {
+            gen_ = gen;
             last_x_ = box_.x_min;
             last_y_ = box_.y_min;
             seq_.clear();
+            // drop whatever image was on screen before placing this one
+            seq_ += "\033_Ga=d\033\\";
 
             // Use kitty +kitten icat directly to bypass any manual protocol logic!
             // We tell it to place the image exactly inside our box dimensions.
@@ -70,6 +88,7 @@ private:
     int last_x_ = -1;
     int last_y_ = -1;
     bool uploaded_ = false;
+    uint64_t gen_ = 0;
     std::string seq_;
 };
 
